@@ -25,9 +25,6 @@ class AgentCoreService:
         self.credentials = self.session.get_credentials()
         self.region = os.environ.get('AWS_REGION', 'us-east-1')
         self.ontology_runtime_arn = os.environ.get('ONTOLOGY_RUNTIME_ARN')
-        self.metadata_runtime_arn = os.environ.get('METADATA_RUNTIME_ARN')
-        self.metadata_query_runtime_arn = os.environ.get('METADATA_QUERY_RUNTIME_ARN')
-        self.suggestions_runtime_arn = os.environ.get('SUGGESTIONS_RUNTIME_ARN')
 
         if not self.ontology_runtime_arn:
             logger.warning("ONTOLOGY_RUNTIME_ARN environment variable not set")
@@ -113,116 +110,6 @@ class AgentCoreService:
             # Catch all exceptions including botocore.exceptions.ClientError
             logger.warning(f"Error invoking AgentCore: {e}", exc_info=True)
             raise Exception(f"Failed to invoke AgentCore: {str(e)}")
-
-    def invoke_metadata_agent(self, id: str) -> Dict[str, Any]:
-        """
-        Invoke the Metadata Agent on AgentCore Runtime
-
-        The agent reads its full config (dataSources, descriptions,
-        enrichmentAnnotations) from DynamoDB using id — matching the
-        ontology agent's pattern exactly.
-
-        Args:
-            id: Unique identifier for the job (used as session_id); must be ≥33 chars
-
-        Returns:
-            Dictionary containing the agent response
-
-        Raises:
-            ValueError: If METADATA_RUNTIME_ARN is not configured
-        """
-        if not self.metadata_runtime_arn:
-            raise ValueError("METADATA_RUNTIME_ARN not configured")
-
-        payload: Dict[str, Any] = {'id': id}
-
-        agentcore_client = boto3.client('bedrock-agentcore', region_name=self.region)
-        response = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=self.metadata_runtime_arn,
-            runtimeSessionId=id,
-            payload=json.dumps(payload).encode('utf-8'),
-            qualifier='DEFAULT',
-        )
-        content = [chunk.decode('utf-8') for chunk in response.get('response', [])]
-        response_text = ''.join(content)
-        try:
-            response_data = json.loads(response_text)
-        except json.JSONDecodeError:
-            response_data = {'result': response_text}
-        return {'success': True, 'data': response_data, 'sessionId': id}
-
-    def invoke_metadata_query_agent(
-        self, question: str, id: str
-    ) -> Dict[str, Any]:
-        """
-        Invoke the Metadata Query Agent on AgentCore Runtime
-
-        Args:
-            question: Natural language question about metadata
-            id: Metadata config ID (used by the agent to look up config in DynamoDB)
-
-        Returns:
-            Dictionary containing the agent response
-
-        Raises:
-            ValueError: If METADATA_QUERY_RUNTIME_ARN is not configured
-        """
-        if not self.metadata_query_runtime_arn:
-            raise ValueError("METADATA_QUERY_RUNTIME_ARN not configured")
-
-        import uuid
-        session_id = str(uuid.uuid4())  # must be ≥33 chars for runtimeSessionId
-        payload = {'question': question, 'id': id}
-
-        agentcore_client = boto3.client('bedrock-agentcore', region_name=self.region)
-        response = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=self.metadata_query_runtime_arn,
-            runtimeSessionId=session_id,
-            payload=json.dumps(payload).encode('utf-8'),
-            qualifier='DEFAULT',
-        )
-        content = [chunk.decode('utf-8') for chunk in response.get('response', [])]
-        response_text = ''.join(content)
-        try:
-            response_data = json.loads(response_text)
-        except json.JSONDecodeError:
-            response_data = {'result': response_text}
-        return {'success': True, 'data': response_data, 'sessionId': session_id}
-
-    def invoke_suggestions_agent(self, id: str) -> Dict[str, Any]:
-        """
-        Invoke the Query Suggestions Agent on AgentCore Runtime.
-
-        Args:
-            id: Ontology config ID — agent reads KB config from DynamoDB
-
-        Returns:
-            Dict with 'success', 'data' (containing 'suggestions' list), 'sessionId'
-
-        Raises:
-            ValueError: If SUGGESTIONS_RUNTIME_ARN is not configured
-        """
-        if not self.suggestions_runtime_arn:
-            raise ValueError("SUGGESTIONS_RUNTIME_ARN environment variable is not configured")
-
-        import uuid
-        session_id = str(uuid.uuid4())
-        payload = {'id': id}
-
-        agentcore_client = boto3.client('bedrock-agentcore', region_name=self.region)
-        response = agentcore_client.invoke_agent_runtime(
-            agentRuntimeArn=self.suggestions_runtime_arn,
-            runtimeSessionId=session_id,
-            payload=json.dumps(payload).encode('utf-8'),
-            qualifier='DEFAULT',
-        )
-        content = [chunk.decode('utf-8') for chunk in response.get('response', [])]
-        response_text = ''.join(content)
-        try:
-            response_data = json.loads(response_text)
-        except json.JSONDecodeError:
-            response_data = {'result': response_text}
-        return {'success': True, 'data': response_data, 'sessionId': session_id}
 
     def invoke_query_agent(self) -> Dict[str, Any]:
         """

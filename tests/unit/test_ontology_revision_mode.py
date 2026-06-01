@@ -2,7 +2,7 @@
 Unit tests for ontology agent revision mode workflow.
 
 Run locally:
-    cd /Users/huthmac/Documents/AWS/00_workspace/semantic-layer
+    cd <repo-root>
     pytest tests/unit/test_ontology_revision_mode.py -v
 """
 import json

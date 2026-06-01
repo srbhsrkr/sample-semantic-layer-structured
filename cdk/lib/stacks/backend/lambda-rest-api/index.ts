@@ -34,15 +34,12 @@ export interface LambdaRestApiStackProps extends StackProps {
   cloudFrontHeaderSecret?: string; // Optional: Custom header secret for CloudFront verification
   // Ontology metadata table (required for semantic layer operations)
   ontologyMetadataTable?: dynamodb.ITable;
-  // AgentCore Runtime ARNs
-  ontologyRuntimeArn?: string; // Ontology generation agent
-  queryRuntimeArn?: string; // Semantic query agent
-  metadataRuntimeArn?: string; // Metadata generation agent
-  metadataQueryRuntimeArn?: string; // Metadata query agent
-  suggestionsRuntimeArn?: string; // Query suggestions agent
+  // AgentCore Runtime ARNs (VKG only)
+  ontologyRuntimeArn: string; // Ontology generation agent
+  queryRuntimeArn: string; // Ontology query agent
   // AgentCore Gateway configuration
-  neptuneGatewayUrl?: string; // Neptune Gateway URL (omit when ontology agents disabled)
-  neptuneGatewayArn?: string; // Neptune Gateway ARN for IAM permissions (omit when ontology agents disabled)
+  neptuneGatewayUrl?: string;
+  neptuneGatewayArn?: string;
   // Data Lake configuration for Lake Formation permissions
   glueNamespaceDynamoDB: string; // Glue DynamoDB database name (e.g., 'semantic_layer_dynamodb')
   // Lake Formation admin chain — must carry forward all prior LF admins when superseding
@@ -110,21 +107,10 @@ export class LambdaRestApiStack extends CommonStack {
               effect: iam.Effect.ALLOW,
               actions: ['bedrock-agentcore:InvokeAgentRuntime'],
               resources: [
-                ...(props.ontologyRuntimeArn
-                  ? [props.ontologyRuntimeArn, `${props.ontologyRuntimeArn}/*`]
-                  : []),
-                ...(props.queryRuntimeArn
-                  ? [props.queryRuntimeArn, `${props.queryRuntimeArn}/*`]
-                  : []),
-                ...(props.metadataRuntimeArn
-                  ? [props.metadataRuntimeArn, `${props.metadataRuntimeArn}/*`]
-                  : []),
-                ...(props.metadataQueryRuntimeArn
-                  ? [props.metadataQueryRuntimeArn, `${props.metadataQueryRuntimeArn}/*`]
-                  : []),
-                ...(props.suggestionsRuntimeArn
-                  ? [props.suggestionsRuntimeArn, `${props.suggestionsRuntimeArn}/*`]
-                  : []),
+                props.ontologyRuntimeArn,
+                `${props.ontologyRuntimeArn}/*`,
+                props.queryRuntimeArn,
+                `${props.queryRuntimeArn}/*`,
               ],
             }),
 
@@ -185,6 +171,32 @@ export class LambdaRestApiStack extends CommonStack {
               effect: iam.Effect.ALLOW,
               actions: ['lakeformation:GetDataAccess'],
               resources: ['*'],
+            }),
+
+            // Athena metadata APIs for federated Lambda data catalogs (e.g. dynamodb_catalog).
+            // Glue's catalog APIs only see Glue catalogs; Lambda-backed federated connectors
+            // (DynamoDB, JDBC, etc.) expose their database/table metadata exclusively through
+            // Athena. The KB-source picker uses these to list and pick federated tables.
+            new iam.PolicyStatement({
+              effect: iam.Effect.ALLOW,
+              actions: [
+                'athena:ListDataCatalogs',
+                'athena:ListDatabases',
+                'athena:ListTableMetadata',
+                'athena:GetTableMetadata',
+              ],
+              resources: ['*'],
+            }),
+
+            // Invoke the federated connector Lambda. Athena's metadata APIs above call the
+            // connector for ListSchemas / ListTables / GetTable, which in turn requires the
+            // caller (this Lambda role) to have lambda:InvokeFunction on the connector.
+            new iam.PolicyStatement({
+              effect: iam.Effect.ALLOW,
+              actions: ['lambda:InvokeFunction'],
+              resources: [
+                `arn:aws:lambda:${this.region}:${this.account}:function:${props.projectId}-ddb-connector`,
+              ],
             }),
 
             // S3 Tables: list table buckets and tables via the dedicated s3tables API.
@@ -328,12 +340,9 @@ export class LambdaRestApiStack extends CommonStack {
           props.ontologyMetadataTable?.tableName || 'semantic-layer-metadata',
         // Dedicated table for async query tracking (status + S3 result key)
         QUERY_RESULTS_TABLE: queryResultsTable.tableName,
-        // AgentCore Runtime ARNs
-        ONTOLOGY_RUNTIME_ARN: props.ontologyRuntimeArn || '',
-        QUERY_RUNTIME_ARN: props.queryRuntimeArn || '',
-        METADATA_RUNTIME_ARN: props.metadataRuntimeArn || '',
-        METADATA_QUERY_RUNTIME_ARN: props.metadataQueryRuntimeArn || '',
-        SUGGESTIONS_RUNTIME_ARN: props.suggestionsRuntimeArn || '',
+        // AgentCore Runtime ARNs (VKG only)
+        ONTOLOGY_RUNTIME_ARN: props.ontologyRuntimeArn,
+        QUERY_RUNTIME_ARN: props.queryRuntimeArn,
         // Neptune Gateway configuration (IAM authenticated)
         NEPTUNE_GATEWAY_URL: props.neptuneGatewayUrl ?? '',
         // Bedrock Guardrails

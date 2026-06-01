@@ -15,11 +15,11 @@
     ]
   },
   "context": {
-    "enableOntologyAgents": false,
-    "enableRealtimeReplication": false,
-    "enableBatchReplication": true,
     "enableDirectAuth": true,
     "selfSignUpEnabled": false,
+    "enableOntologyAgents": true,
+    "enableRealtimeReplication": false,
+    "enableBatchReplication": true,
     "midway": false,
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:checkSecretUsage": true,

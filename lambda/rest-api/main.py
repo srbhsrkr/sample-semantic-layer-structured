@@ -35,7 +35,6 @@ from ontology_api import app as ontology_api_app
 from datasource_api import app as datasource_api_app
 from query_api import app as query_api_app
 from neptune_api import app as neptune_api_app
-from metadata_api import app as metadata_api_app
 
 # Initialize SSM client for parameter retrieval
 ssm_client = None
@@ -137,7 +136,6 @@ async def root():
             "datasource": "/datasource/*",
             "query": "/query/*",
             "neptune": "/neptune/*",
-            "metadata": "/metadata/*",
         },
     }
 
@@ -183,9 +181,6 @@ app.mount("/query", query_api_app)
 logger.info("Mounting neptune API at /neptune")
 app.mount("/neptune", neptune_api_app)
 
-logger.info("Mounting metadata API at /metadata")
-app.mount("/metadata", metadata_api_app)
-
 logger.info("FastAPI app initialized successfully")
 
 
@@ -205,21 +200,14 @@ def handler(event, context):
     """
     Main Lambda handler.
 
-    Routes three event types:
+    Routes two event types:
     - _worker events: async self-invocations for VKG AgentCore queries
-    - _metadata_worker events: async self-invocations for metadata queries
     - HTTP events: standard API Gateway requests handled via Mangum/FastAPI
     """
     if event.get('_worker'):
         from services.query_service import QueryService
         qs = QueryService()
         qs.process_worker_event(event)
-        return {'statusCode': 200}
-
-    if event.get('_metadata_worker'):
-        from services.metadata_service import MetadataService
-        ms = MetadataService()
-        ms.process_metadata_worker_event(event)
         return {'statusCode': 200}
 
     return mangum_handler(event, context)

@@ -52,7 +52,7 @@ export default function AdminDashboard({ user }) {
       const result = await ontologyAPI.deleteOntology(ontologyToDelete.id);
 
       if (result.success) {
-        setSuccess(`Semantic metadata "${ontologyToDelete.name || ontologyToDelete.id}" deleted successfully`);
+        setSuccess(`Semantic knowledge base "${ontologyToDelete.name || ontologyToDelete.id}" deleted successfully`);
         setDeleteModalVisible(false);
         setOntologyToDelete(null);
         // Reload the ontologies list
@@ -135,13 +135,13 @@ export default function AdminDashboard({ user }) {
     <SpaceBetween size="l">
       <Header
         variant="h1"
-        description="Manage your semantic metadata layers"
+        description="Manage your semantic knowledge bases"
         actions={
           <Button
             variant="primary"
             onClick={() => navigate('/admin/describe-intent')}
           >
-            Create New Semantic Metadata
+            Create New Semantic Knowledge Base
           </Button>
         }
       >
@@ -162,16 +162,16 @@ export default function AdminDashboard({ user }) {
 
       <Container
         header={
-          <Header variant="h2">Semantic Metadata</Header>
+          <Header variant="h2">Semantic Knowledge Bases</Header>
         }
       >
         {loading ? (
           <Box textAlign="center" padding="l">
-            <StatusIndicator type="loading">Loading semantic metadata...</StatusIndicator>
+            <StatusIndicator type="loading">Loading semantic knowledge bases...</StatusIndicator>
           </Box>
         ) : ontologies.length === 0 ? (
           <Box textAlign="center" padding="l" color="text-status-inactive">
-            No semantic metadata created yet. Click "Create New Semantic Metadata" to get started.
+            No semantic knowledge bases created yet. Click "Create New Semantic Knowledge Base" to get started.
           </Box>
         ) : (
           <Cards
@@ -234,7 +234,7 @@ export default function AdminDashboard({ user }) {
       <Modal
         visible={deleteModalVisible}
         onDismiss={handleDeleteCancel}
-        header="Delete Semantic Metadata"
+        header="Delete Semantic Knowledge Base"
         closeAriaLabel="Close modal"
         footer={
           <Box float="right">
@@ -261,13 +261,13 @@ export default function AdminDashboard({ user }) {
             </Alert>
           )}
           <Box>
-            Are you sure you want to delete the semantic metadata{' '}
+            Are you sure you want to delete the semantic knowledge base{' '}
             <strong>{ontologyToDelete?.name || ontologyToDelete?.id}</strong>?
           </Box>
           <Alert type="warning">
             This action cannot be undone. All associated data, including:
             <ul>
-              <li>Semantic metadata configuration</li>
+              <li>Semantic knowledge base configuration</li>
               <li>Generated metadata files</li>
               <li>Uploaded files</li>
               <li>Metadata</li>

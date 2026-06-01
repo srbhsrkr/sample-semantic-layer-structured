@@ -10,6 +10,7 @@ import os
 import json
 import logging
 import re
+from datetime import datetime, timezone
 import boto3
 try:
     from bedrock_agentcore.runtime import BedrockAgentCoreApp
@@ -34,6 +35,9 @@ from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
 from .token_manager import count_tokens, get_token_status
 
 from .query_prompts import SYSTEM_PROMPT, QUERY_MODEL_ID, QueryAnswer
+from .schema_digest import build_schema_digest
+from .supervisor import SupervisorState
+from .supervisor_runner import run_supervised
 
 # Configure logging
 logging.basicConfig(
@@ -66,6 +70,48 @@ _agent_state = {
     'current_session': None,
     'cached_results': {}
 }
+
+# In-process cache for the get_ontology_from_neptune MCP tool response.
+# Keyed by ontology_id (the `id` from the invoke payload). Lives for the
+# lifetime of the runtime container — survives across invocations within a
+# warm runtime, drops on cold start. The ontology is rebuilt only when the
+# user re-runs the ontology-generation agent (rare), so a process-lifetime
+# cache is correct for typical bursty query traffic.
+_ontology_cache: Dict[str, str] = {}
+
+# Per-invocation context shared with @tool-decorated functions so they can
+# write step labels to the query-results DDB row without changing their
+# tool-schema signatures (Strands derives the schema from the @tool args).
+# Set by invoke() at the start of each call; cleared on exit.
+_invocation_ctx: Dict[str, Optional[str]] = {
+    'query_id': None,
+    'query_results_table': None,
+}
+
+
+def _write_step(step: str) -> None:
+    """Best-effort: write current_step to the query-results DDB row.
+
+    Skipped silently when query_id/table are not provided (agent invoked
+    outside the lambda async path) or when the DDB write fails. Step labels
+    are diagnostic UX — they must never break a query.
+    """
+    qid = _invocation_ctx.get('query_id')
+    tbl = _invocation_ctx.get('query_results_table')
+    if not qid or not tbl:
+        return
+    try:
+        table = dynamodb.Table(tbl)
+        table.update_item(
+            Key={'queryId': qid},
+            UpdateExpression='SET current_step = :s, updated_at = :u',
+            ExpressionAttributeValues={
+                ':s': step,
+                ':u': datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    except Exception as e:
+        logger.debug(f"step-label write failed for {qid} step={step}: {e}")  # nosec B110
 
 # Global boto3 session for credential injection (used in notebooks/testing)
 _boto_session = None
@@ -181,6 +227,7 @@ def disambiguate_query_terms(user_query: str, ontology_info: str,
 
     try:
         _agent_state['disambiguation_complete'] = True
+        _write_step('disambiguating_terms')
         logger.info("=== disambiguate_query_terms STARTED ===")
         logger.info(f"User query: {user_query}")
 
@@ -189,6 +236,16 @@ def disambiguate_query_terms(user_query: str, ontology_info: str,
 
         if "error" in ontology:
             return json.dumps({"error": f"Ontology error: {ontology['error']}"})
+
+        # Cache a compact schema digest so the supervisor + decomposer can reason
+        # about table/column structure without re-reading the full ontology.
+        try:
+            digest = build_schema_digest(ontology)
+            if digest:
+                _agent_state['cached_results']['schema_digest'] = digest
+                logger.info(f"Cached schema digest: {len(digest)} chars")
+        except Exception as e:
+            logger.warning(f"Failed to build schema digest: {e}")
 
         # Extract query terms (simple word tokenization)
         # Remove common words and extract potential entity/table references
@@ -441,6 +498,7 @@ def execute_sql_query(sql_query: str, database_name: str, catalog_id: str) -> st
         # NOTE: Do NOT set query_executed = True here. It is only set after a
         # successful execution so that the agent can retry with a corrected query
         # if the first attempt fails (e.g. wrong catalog or schema).
+        _write_step('running_athena')
         logger.info("=== execute_sql_query STARTED ===")
         logger.info(f"Original SQL  : {sql_query}")
         logger.info(f"Database param: {database_name}")
@@ -644,6 +702,7 @@ def map_sql_results_to_rdf(query_results: str, ontology_info: str, max_rows: int
 
     try:
         _agent_state['rdf_mapped'] = True
+        _write_step('mapping_to_rdf')
         logger.info("=== map_sql_results_to_rdf STARTED ===")
 
         results = json.loads(query_results)
@@ -805,8 +864,12 @@ def get_latest_metadata_item(id: str) -> Optional[dict]:
 
 
 def _make_neptune_tool_logger(session_id: str):
-    """Return a Strands callback_handler that logs get_ontology_from_neptune I/O."""
-    _pending: dict = {}  # toolUseId -> tool name
+    """Return a Strands callback_handler that logs get_ontology_from_neptune I/O.
+
+    Also populates the module-level _ontology_cache on the way out so subsequent
+    invocations against the same ontology can skip the ~6s gateway round-trip.
+    """
+    _pending: dict = {}  # toolUseId -> {name, ontology_id}
 
     def handler(**kwargs):
         # ── Input: tool use initiated ──────────────────────────────────────────
@@ -816,11 +879,18 @@ def _make_neptune_tool_logger(session_id: str):
             if 'get_ontology_from_neptune' in name:
                 tool_id = current_tool_use.get('toolUseId', '')
                 tool_input = current_tool_use.get('input', {})
-                _pending[tool_id] = name
+                ont_id = tool_input.get('ontology_id', '') if isinstance(tool_input, dict) else ''
+                _pending[tool_id] = {'name': name, 'ontology_id': ont_id}
+                _write_step('fetching_ontology')
                 logger.info(
                     f"[{session_id}] === get_ontology_from_neptune INPUT === "
                     f"{json.dumps(tool_input)}"
                 )
+            elif 'execute_sparql_query' in name:
+                _write_step('querying_neptune')
+            elif 'execute_sql' in name:
+                # Fallback if Strands routes through callback before tool runs.
+                _write_step('generating_sql')
 
         # ── Output: tool result returned to model ──────────────────────────────
         message = kwargs.get('message')
@@ -847,20 +917,31 @@ def _make_neptune_tool_logger(session_id: str):
                     f"[{session_id}] === get_ontology_from_neptune RESPONSE "
                     f"({len(result_str)} chars) === {preview}"
                 )
+                ont_id = _pending[tool_id].get('ontology_id', '')
+                if ont_id and result_str and '"error"' not in result_str[:200]:
+                    _ontology_cache[ont_id] = result_str
+                    logger.info(
+                        f"[{session_id}] Cached ontology {ont_id} ({len(result_str)} chars)"
+                    )
                 del _pending[tool_id]
 
     return handler
 
 
-def create_query_agent(callback_handler=None) -> Agent:
-    """Create and configure the Virtual KG query agent"""
-    region = get_region()
-    model = BedrockModel(
+def _build_query_model() -> BedrockModel:
+    """Build the BedrockModel used by both the main agent and supervisor judges."""
+    return BedrockModel(
         model_id=QUERY_MODEL_ID,
         temperature=0.0,
         max_tokens=4000,
         boto_session=get_boto_session(),
     )
+
+
+def create_query_agent(callback_handler=None) -> Agent:
+    """Create and configure the Virtual KG query agent"""
+    region = get_region()
+    model = _build_query_model()
 
     # Configure MCP client for Neptune Gateway with IAM authentication
     mcp_clients = []
@@ -912,6 +993,16 @@ def create_query_agent(callback_handler=None) -> Agent:
     return agent
 
 
+def run_single_shot(user_input: str, agent_factory) -> Any:
+    """Single-pass agent invocation — no supervisor judge, no retry loop.
+
+    Mirrors the pre-supervisor behaviour kept around for the Advanced toggle.
+    Returns the same AgentResult shape that run_supervised returns.
+    """
+    agent = agent_factory()
+    return agent(user_input)
+
+
 @app.entrypoint
 def invoke(payload: Dict[str, Any], context=None) -> Dict[str, Any]:
     """
@@ -939,6 +1030,12 @@ def invoke(payload: Dict[str, Any], context=None) -> Dict[str, Any]:
         if not question:
             return {'error': 'question is required in payload'}
 
+        # Optional: when invoked by the lambda async worker, the payload carries
+        # query_id + query_results_table so we can write step labels back to the
+        # same DDB row that the frontend polls.
+        _invocation_ctx['query_id'] = payload.get('query_id') or None
+        _invocation_ctx['query_results_table'] = payload.get('query_results_table') or None
+
         id = payload.get('id', '')
         config = get_latest_metadata_item(id)
         if not config:
@@ -946,17 +1043,66 @@ def invoke(payload: Dict[str, Any], context=None) -> Dict[str, Any]:
 
         ontology_name = config.get('name', '')
         catalog_id_hint = payload.get('catalog_id', '')
-        agent = create_query_agent(callback_handler=_make_neptune_tool_logger(session_id))
         hint = f"[ontology: {id}]"
         if catalog_id_hint:
             hint += f"[catalog: {catalog_id_hint}]"
-        user_input = f"{hint}\n{question}"
 
-        logger.info(f"Agent session {session_id} — ontology name: {ontology_name}, question: {question[:80]}")
+        # Process-lifetime cache: if we've already fetched this ontology, hand
+        # the agent the JSON directly so it can skip the ~6s gateway round-trip.
+        # The system prompt reads the [ontology_cached] hint and proceeds from
+        # disambiguate_query_terms with the inlined payload as ontology_info.
+        cached_ontology = _ontology_cache.get(id)
+        if cached_ontology:
+            logger.info(
+                f"Ontology cache HIT for {id} ({len(cached_ontology)} chars) — "
+                "agent will skip get_ontology_from_neptune"
+            )
+            user_input = (
+                f"{hint}[ontology_cached: true]\n"
+                f"{question}\n\n"
+                f"[ontology_payload]\n{cached_ontology}\n[/ontology_payload]"
+            )
+        else:
+            logger.info(f"Ontology cache MISS for {id} — agent will fetch from Neptune")
+            user_input = f"{hint}\n{question}"
+
+        # Mode toggle: 'supervisor' (default) runs the judge-driven retry loop;
+        # 'single_shot' runs the agent once with no supervisor wrapping. The UI
+        # exposes this as the "Advanced" toggle on the query page.
+        mode = (payload.get('mode') or 'supervisor').lower()
+        if mode not in ('supervisor', 'single_shot'):
+            logger.warning(f"Unknown mode '{mode}' — falling back to 'supervisor'")
+            mode = 'supervisor'
+
+        logger.info(f"Agent session {session_id} — ontology name: {ontology_name}, mode: {mode}, question: {question[:80]}")
         logger.info(f"Starting agent session {session_id} with input: {user_input[:100]}...")
+        _write_step(f'invoking_agent_{mode}')
+
+        def _agent_factory():
+            return create_query_agent(callback_handler=_make_neptune_tool_logger(session_id))
+
+        def _cached_state_getter():
+            return dict(_agent_state.get('cached_results', {}))
 
         try:
-            response = agent(user_input)
+            if mode == 'single_shot':
+                response = run_single_shot(
+                    user_input=user_input,
+                    agent_factory=_agent_factory,
+                )
+            else:
+                # Supervisor runs the agent with retry budget + optional decomposition.
+                # We rebuild the agent on each attempt so MCP clients reset cleanly.
+                sup_state = SupervisorState(session_id=session_id, question=question)
+                response = run_supervised(
+                    user_input=user_input,
+                    question=question,
+                    state=sup_state,
+                    agent_factory=_agent_factory,
+                    model_factory=_build_query_model,
+                    state_resetter=reset_agent_state,
+                    cached_state_getter=_cached_state_getter,
+                )
         except Exception as soe:
             if StructuredOutputException and isinstance(soe, StructuredOutputException):
                 # Structured output validation failed — fall back to raw text answer
@@ -965,6 +1111,7 @@ def invoke(payload: Dict[str, Any], context=None) -> Dict[str, Any]:
             else:
                 raise
 
+        _write_step('summarizing')
         logger.info(f"Agent session {session_id} completed successfully")
         logger.info(f"Final state: {_agent_state}")
 
@@ -1084,6 +1231,9 @@ def invoke(payload: Dict[str, Any], context=None) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error in invoke: {str(e)}")
         return {"error": f"Agent execution failed: {str(e)}"}
+    finally:
+        _invocation_ctx['query_id'] = None
+        _invocation_ctx['query_results_table'] = None
 
 if __name__ == '__main__':
     try:

@@ -135,15 +135,16 @@ export class ArmBuildConstruct extends Construct {
           },
           build: {
             commands: [
-              'if [ "$SKIP_BUILD" = "false" ]; then echo \'Building Docker image...\'; docker build -f $DOCKERFILE_NAME -t $ECR_REPO_URI:$IMAGE_TAG -t $ECR_REPO_URI:latest .; else echo \'Skipping build - image exists\'; fi',
+              // ECR repo is IMMUTABLE — only tag with the source-hash IMAGE_TAG.
+              // A `latest` tag would fail to overwrite on every subsequent build.
+              'if [ "$SKIP_BUILD" = "false" ]; then echo \'Building Docker image...\'; docker build -f $DOCKERFILE_NAME -t $ECR_REPO_URI:$IMAGE_TAG .; else echo \'Skipping build - image exists\'; fi',
             ],
           },
           post_build: {
             commands: [
-              'if [ "$SKIP_BUILD" = "false" ]; then echo \'Pushing Docker image to ECR...\'; docker push $ECR_REPO_URI:$IMAGE_TAG; docker push $ECR_REPO_URI:latest; fi',
+              'if [ "$SKIP_BUILD" = "false" ]; then echo \'Pushing Docker image to ECR...\'; docker push $ECR_REPO_URI:$IMAGE_TAG; fi',
               'echo "Build completed on $(date)"',
               'echo "Image URI: $ECR_REPO_URI:$IMAGE_TAG"',
-              'echo "Also tagged as: $ECR_REPO_URI:latest"',
             ],
           },
         },

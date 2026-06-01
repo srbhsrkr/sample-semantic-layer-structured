@@ -182,7 +182,13 @@ def test_sample_table_data_s3tables_catalog_skips_glue_lookup():
         # Glue was NOT called (non-AWSDataCatalog catalog)
         glue.get_table.assert_not_called()
 
-        # S3 Tables catalog forwarded in query context
+        # S3 Tables federated catalog: Athena does not expose it as a top-level
+        # data catalog, so the tool routes via AwsDataCatalog with a three-part
+        # name in the FROM clause.
         call_kwargs = athena.start_query_execution.call_args.kwargs
-        assert call_kwargs["QueryExecutionContext"]["Catalog"] == "s3tablescatalog/my-bucket"
+        assert call_kwargs["QueryExecutionContext"]["Catalog"] == "AwsDataCatalog"
+        assert (
+            '"s3tablescatalog/my-bucket"."my_namespace"."my_iceberg_table"'
+            in call_kwargs["QueryString"]
+        )
         assert result["success"] is True

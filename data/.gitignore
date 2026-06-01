@@ -1,8 +1,10 @@
 # Ignore downloaded ontology sources (large files ~500MB)
 ontology-sources/
 
-# Ignore converted markdown docs (generated files)
-ontology-docs/
+# Ignore converted markdown docs (generated files), but track the placeholder
+# README so the CDK BucketDeployment asset path always exists.
+ontology-docs/*
+!ontology-docs/README.md
 
 # Python virtual environments
 venv/

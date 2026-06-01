@@ -3,6 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as neptune from 'aws-cdk-lib/aws-neptune';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 
 export interface NeptuneStackProps extends cdk.StackProps {
@@ -103,6 +104,7 @@ export class NeptuneStack extends cdk.Stack {
       dbInstanceClass: 'db.r6g.xlarge',
       dbClusterIdentifier: this.cluster.ref,
       dbInstanceIdentifier: `${props.projectName}-neptune-instance-1`,
+      autoMinorVersionUpgrade: true,
     });
 
     primaryInstance.addDependency(this.cluster);
@@ -112,6 +114,7 @@ export class NeptuneStack extends cdk.Stack {
       dbInstanceClass: 'db.r6g.large',
       dbClusterIdentifier: this.cluster.ref,
       dbInstanceIdentifier: `${props.projectName}-neptune-instance-2`,
+      autoMinorVersionUpgrade: true,
     });
 
     readerInstance.addDependency(this.cluster);
@@ -138,6 +141,17 @@ export class NeptuneStack extends cdk.Stack {
     });
 
     this.connectionSecretName = this.connectionSecret.secretName;
+
+    // The "connection secret" stores endpoint metadata only (URLs, ARNs, port).
+    // Neptune authentication uses IAM (iamAuthEnabled: true on the cluster), so
+    // there are no credentials to rotate. SMG4 is a false positive here.
+    NagSuppressions.addResourceSuppressions(this.connectionSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason:
+          'Secret stores only Neptune connection metadata (endpoints, ARNs). Neptune uses IAM auth, so there are no credentials to rotate.',
+      },
+    ]);
 
     // Outputs
     new cdk.CfnOutput(this, 'NeptuneClusterEndpoint', {

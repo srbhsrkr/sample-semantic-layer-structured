@@ -93,7 +93,13 @@ export class GuardrailsStack extends CommonStack {
             name: "FINANCIAL_ADVICE",
             type: "DENY",
             definition:
-              "Offering guidance or suggestions on financial investments, financial planning, or financial decisions.",
+              "Personalized recommendations on what investments, products, or financial actions a person should take.",
+            examples: [
+              "Should I invest in this stock?",
+              "What's the best mutual fund for retirement?",
+              "Help me decide whether to buy term or whole life insurance.",
+              "What investment portfolio do you recommend for me?",
+            ],
           },
           {
             name: "LEGAL_ADVICE",

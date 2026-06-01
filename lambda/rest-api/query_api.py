@@ -31,6 +31,9 @@ agentcore_service = AgentCoreService()
 class SubmitQueryRequest(BaseModel):
     question: str
     id: str
+    # 'supervisor' (default) runs the judge-driven retry loop;
+    # 'single_shot' runs the agent once with no supervisor wrapping.
+    mode: str = 'supervisor'
 
 
 # ============================================================================
@@ -57,6 +60,7 @@ async def submit_query(request: SubmitQueryRequest):
         result = query_service.submit_query(
             question=request.question,
             id=request.id,
+            mode=request.mode,
         )
 
         return JSONResponse(content=result, status_code=202)
@@ -119,49 +123,6 @@ async def get_query_status(query_id: str):
         raise
     except Exception as e:
         logger.error(f"Error getting query status: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
-# Query Suggestions Endpoint
-# ============================================================================
-
-@app.get("/suggestions/{ontology_id}")
-async def get_query_suggestions(ontology_id: str):
-    """
-    Generate AI-powered suggested questions for a semantic metadata layer.
-
-    Invokes the Query Suggestions Agent synchronously. The agent retrieves
-    schema context from the Bedrock Knowledge Base and generates 5-8 diverse
-    questions relevant to the ontology's data model.
-
-    Args:
-        ontology_id: The ontology config ID to generate suggestions for
-
-    Returns:
-        JSON with 'suggestions' list: [{"category": str, "question": str}]
-    """
-    try:
-        logger.info(f"Generating query suggestions for ontology: {ontology_id}")
-        result = agentcore_service.invoke_suggestions_agent(id=ontology_id)
-
-        if not result.get('success'):
-            raise HTTPException(status_code=500, detail="Suggestions agent failed")
-
-        data = result.get('data', {})
-        if 'error' in data:
-            logger.error(f"Suggestions agent returned error: {data['error']}")
-            raise HTTPException(status_code=500, detail=data['error'])
-
-        return JSONResponse(content=data)
-
-    except HTTPException:
-        raise
-    except ValueError as e:
-        logger.error(f"Configuration error for suggestions: {e}")
-        raise HTTPException(status_code=503, detail=str(e))
-    except Exception as e:
-        logger.error(f"Error getting query suggestions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

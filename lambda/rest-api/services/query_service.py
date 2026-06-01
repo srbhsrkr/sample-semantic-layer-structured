@@ -161,13 +161,20 @@ class QueryService:
         self,
         question: str,
         id: str,
+        mode: str = 'supervisor',
     ) -> Dict[str, Any]:
         """
         Accept a query and return immediately.
         Processing happens asynchronously via Lambda self-invocation.
+
+        `mode` selects the agent flow: 'supervisor' (judge-driven retry loop,
+        default) or 'single_shot' (one-pass agent call). Forwarded to AgentCore.
         """
         if not self.query_runtime_arn and not self.metadata_query_runtime_arn:
             raise ValueError("Neither QUERY_RUNTIME_ARN nor METADATA_QUERY_RUNTIME_ARN is configured")
+
+        if mode not in ('supervisor', 'single_shot'):
+            mode = 'supervisor'
 
         query_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc).isoformat()
@@ -176,6 +183,7 @@ class QueryService:
             'status': 'SUBMITTED',
             'question': question,
             'id': id,
+            'mode': mode,
             'created_at': now,
             'updated_at': now,
             'expires': self._ttl_epoch(),
@@ -191,9 +199,10 @@ class QueryService:
                     'query_id': query_id,
                     'question': question,
                     'id': id,
+                    'mode': mode,
                 }).encode(),
             )
-            logger.info(f"Async worker invoked for query {query_id}")
+            logger.info(f"Async worker invoked for query {query_id} (mode={mode})")
         else:
             logger.error("AWS_LAMBDA_FUNCTION_NAME not set — worker cannot be invoked")
 
@@ -211,10 +220,17 @@ class QueryService:
         query_id = event['query_id']
         question = event['question']
         id = event['id']
+        mode = event.get('mode', 'supervisor')
+        if mode not in ('supervisor', 'single_shot'):
+            mode = 'supervisor'
 
         logger.info(f"Worker started for query {query_id}")
         now = datetime.now(timezone.utc).isoformat()
-        self._update_query(query_id, {'status': 'RUNNING', 'updated_at': now})
+        self._update_query(query_id, {
+            'status': 'RUNNING',
+            'current_step': 'validating_input',
+            'updated_at': now,
+        })
 
         try:
             # --- INPUT guardrail pre-screen ---
@@ -236,20 +252,39 @@ class QueryService:
             agentcore_client = boto3.client(
                 'bedrock-agentcore',
                 region_name=self.region,
-                config=Config(read_timeout=600, connect_timeout=10),
+                # 14 min read timeout — lambda is 15 min, leave ~60s headroom
+                # for response parsing, S3 write, and DDB update.
+                config=Config(read_timeout=840, connect_timeout=10),
             )
 
+            self._update_query(query_id, {
+                'current_step': 'invoking_agent',
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            })
             logger.info(f"Invoking AgentCore for query {query_id}")
+            # query_id passed so the agent can write granular step labels back
+            # to the same DDB row (best-effort; agent failures here are swallowed).
             response = agentcore_client.invoke_agent_runtime(
                 agentRuntimeArn=runtime_arn,
                 runtimeSessionId=query_id,
-                payload=json.dumps({"question": question, "id": id}).encode('utf-8'),
+                payload=json.dumps({
+                    "question": question,
+                    "id": id,
+                    "mode": mode,
+                    "query_id": query_id,
+                    "query_results_table": self.table_name,
+                }).encode('utf-8'),
                 qualifier='DEFAULT',
             )
 
             chunks = [chunk.decode('utf-8') for chunk in response.get('response', [])]
             response_text = ''.join(chunks)
             logger.info(f"AgentCore response: {len(response_text)} chars for query {query_id}")
+
+            self._update_query(query_id, {
+                'current_step': 'processing_response',
+                'updated_at': datetime.now(timezone.utc).isoformat(),
+            })
 
             # Parse structured JSON from agent response
             result = self._parse_agent_response(response_text)
@@ -307,7 +342,9 @@ class QueryService:
         return {
             'query_id': query_id,
             'status': item['status'],
+            'current_step': item.get('current_step', ''),
             'answer_preview': item.get('answer_preview', ''),
+            'error': item.get('error', ''),
             'created_at': item.get('created_at'),
             'updated_at': item.get('updated_at'),
         }

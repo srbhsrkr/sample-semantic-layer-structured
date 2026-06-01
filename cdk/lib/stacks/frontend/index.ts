@@ -43,7 +43,6 @@ export interface FrontendStackProps extends StackProps {
   // Existing CloudFront distribution and S3 bucket from CloudFrontStorageStack
   readonly distribution: Distribution;
   readonly websiteBucket: s3.Bucket;
-  readonly enableOntologyAgents?: boolean;
 }
 
 export class FrontendStack extends Stack {
@@ -67,7 +66,6 @@ export class FrontendStack extends Stack {
       REACT_APP_CUSTOMER_LOGO: '/amazicon.svg',
       REACT_APP_NO_AUTH: 'false',
       REACT_APP_AUTH_MODE: 'direct', // Show username/password fields directly
-      REACT_APP_ENABLE_ONTOLOGY_AGENTS: String(props.enableOntologyAgents ?? true),
     };
 
     // Create S3 asset from frontend source code (creates a zip file)

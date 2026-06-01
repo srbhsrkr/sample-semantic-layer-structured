@@ -220,9 +220,11 @@ export const dataSourceAPI = {
 // ============================================================================
 export const queryAPI = {
   // Submit natural language query (returns immediately with queryId; poll for result)
-  submitQuery: async (question, id) => {
+  // mode: 'supervisor' (default, judge-driven retry loop) or 'single_shot'
+  // (one-pass agent call, exposed via the Advanced toggle on the query page).
+  submitQuery: async (question, id, mode = 'supervisor') => {
     return handleResponse(
-      apiClient.post('/query/submit', { question, id: id }, {
+      apiClient.post('/query/submit', { question, id: id, mode }, {
         timeout: TIMEOUTS.DEFAULT,
       })
     );
@@ -238,8 +240,11 @@ export const queryAPI = {
     return handleResponse(apiClient.get(`/query/status/${queryId}`));
   },
 
-  // Poll query until complete
-  pollQueryUntilComplete: async (queryId, maxAttempts = 60, intervalMs = 2000) => {
+  // Poll query until complete. onStatus(payload) is called on every tick with
+  // the latest status item — used by the UI to surface current_step labels.
+  // Default cap: 300 × 2s = 10 minutes — matches the lambda → AgentCore
+  // read_timeout in query_service.py so the UI doesn't bail before the worker.
+  pollQueryUntilComplete: async (queryId, { onStatus, maxAttempts = 300, intervalMs = 2000 } = {}) => {
     let attempts = 0;
 
     while (attempts < maxAttempts) {
@@ -247,6 +252,10 @@ export const queryAPI = {
 
       if (!result.success) {
         return result;
+      }
+
+      if (onStatus) {
+        onStatus(result.data);
       }
 
       const status = result.data.status;
@@ -257,6 +266,7 @@ export const queryAPI = {
       } else if (status === 'FAILED' || status === 'ERROR' || status === 'BLOCKED') {
         return {
           success: false,
+          status,
           error: result.data.error || 'Query failed',
         };
       }
@@ -272,131 +282,6 @@ export const queryAPI = {
     };
   },
 
-  // Get AI-generated suggested questions for a semantic metadata layer.
-  // Returns { suggestions: [{ category: string, question: string }] }
-  getSuggestedQuestions: async (ontologyId) => {
-    return handleResponse(
-      apiClient.get(`/query/suggestions/${ontologyId}`, {
-        timeout: TIMEOUTS.LONG_RUNNING,
-      })
-    );
-  },
-};
-
-// ============================================================================
-// METADATA APIs
-// ============================================================================
-
-// Start metadata enrichment — pass the ontology config ID and optional enrichment parameters.
-// options may contain targetTables and/or annotations.
-// The backend reads dataSources (tables + catalogId) from DynamoDB and uses it as the job ID.
-export const startMetadataEnrichment = async (id, options = {}) => {
-  return handleResponse(
-    apiClient.post('/metadata/enrich', { id, ...options }, { timeout: TIMEOUTS.LONG_RUNNING })
-  );
-};
-
-// Start a versioned metadata revision — stamps the active record with revisionMode=True,
-// invokes the metadata agent on the annotation path, and returns {nextVersion}.
-// Call this instead of startMetadataEnrichment when the user submits annotations.
-export const reviseMetadata = async (id, baseVersion, annotations) => {
-  return handleResponse(
-    apiClient.post(`/metadata/revise/${id}/${baseVersion}`, { annotations }, { timeout: TIMEOUTS.LONG_RUNNING })
-  );
-};
-
-// Get metadata enrichment status
-export const getMetadataEnrichmentStatus = async (jobId) => {
-  return handleResponse(apiClient.get(`/metadata/enrich/status/${jobId}`));
-};
-
-// Poll metadata enrichment status until complete
-export const pollMetadataEnrichmentStatus = async (jobId, onProgress, intervalMs = 3000) => {
-  return new Promise((resolve, reject) => {
-    const poll = async () => {
-      try {
-        const result = await getMetadataEnrichmentStatus(jobId);
-        if (!result.success) {
-          return reject(new Error(result.error || 'Failed to get enrichment status'));
-        }
-
-        const data = result.data;
-        if (onProgress) onProgress(data);
-
-        if (data.status === 'completed') {
-          return resolve(data);
-        }
-        if (data.status === 'failed') {
-          return reject(new Error(data.error || 'Enrichment failed'));
-        }
-
-        setTimeout(poll, intervalMs);
-      } catch (err) {
-        reject(err);
-      }
-    };
-    poll();
-  });
-};
-
-// Submit natural language query on metadata
-// The backend resolves dataSources (tables + catalogIds) from the ontology config in DynamoDB.
-export const submitMetadataQuery = async (question, id) => {
-  return handleResponse(
-    apiClient.post('/metadata/query/submit',
-      { question, id },
-      { timeout: TIMEOUTS.LONG_RUNNING }
-    )
-  );
-};
-
-// Get metadata query status
-export const getMetadataQueryStatus = async (queryId) => {
-  return handleResponse(apiClient.get(`/metadata/query/status/${queryId}`));
-};
-
-// Get metadata query result
-export const getMetadataQueryResult = async (queryId) => {
-  return handleResponse(apiClient.get(`/metadata/query/result/${queryId}`));
-};
-
-// Get AI-enriched metadata for a single table from the Knowledge Base (S3 doc)
-export const getTableKBMetadata = async (databaseName, tableName, catalogId) => {
-  const params = catalogId ? `?catalog_id=${encodeURIComponent(catalogId)}` : '';
-  return handleResponse(apiClient.get(`/metadata/table/${encodeURIComponent(databaseName)}/${encodeURIComponent(tableName)}${params}`));
-};
-
-// Poll metadata query until complete and fetch result
-// maxAttempts * intervalMs = total wait (60 * 3000ms = 3 minutes)
-export const pollMetadataQuery = async (queryId, maxAttempts = 60, intervalMs = 3000) => {
-  let attempts = 0;
-
-  while (attempts < maxAttempts) {
-    const statusResult = await getMetadataQueryStatus(queryId);
-
-    if (!statusResult.success) {
-      return { success: false, error: statusResult.error || 'Failed to get query status' };
-    }
-
-    const { status } = statusResult.data;
-
-    if (status === 'completed') {
-      return await getMetadataQueryResult(queryId);
-    }
-
-    if (status === 'failed' || status === 'blocked') {
-      return { success: false, error: statusResult.data.error || 'Metadata query failed' };
-    }
-
-    if (status === 'NOT_FOUND') {
-      return { success: false, error: 'Query not found — the server may have restarted' };
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    attempts++;
-  }
-
-  return { success: false, error: 'Query timed out after 3 minutes' };
 };
 
 // ============================================================================

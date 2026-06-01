@@ -22,8 +22,6 @@ import DescribeIntent from "./pages/admin/DescribeIntent";
 import SelectDataSources from "./pages/admin/SelectDataSources";
 import ReviewMetadata from "./pages/admin/ReviewMetadata";
 import SelectSemanticLayerType from "./pages/admin/SelectSemanticLayerType";
-import BuildSemanticMetadata from "./pages/admin/BuildSemanticMetadata";
-import ViewSemanticRAGMetadata from "./pages/admin/ViewSemanticRAGMetadata";
 import BuildKnowledgeGraph from "./pages/admin/BuildKnowledgeGraph";
 import ViewKnowledgeGraph from "./pages/admin/ViewKnowledgeGraph";
 
@@ -47,8 +45,6 @@ Amplify.configure(amplifyConfig);
 
 // Check if NO_AUTH mode is enabled
 const NO_AUTH = process.env.REACT_APP_NO_AUTH === "true";
-
-const ENABLE_ONTOLOGY_AGENTS = process.env.REACT_APP_ENABLE_ONTOLOGY_AGENTS !== "false";
 
 // Customer branding from environment variables
 const CUSTOMER_NAME = process.env.REACT_APP_CUSTOMER_NAME || "AWS Semantic Layer";
@@ -92,16 +88,6 @@ function AppContent({ signOut, user }) {
         { text: "Home", href: "/" },
         { text: "Admin Dashboard", href: "/admin" },
         { text: "Select Semantic Layer Type", href: "/admin/select-semantic-layer-type" },
-      ],
-      "/admin/build-semantic-metadata": [
-        { text: "Home", href: "/" },
-        { text: "Admin Dashboard", href: "/admin" },
-        { text: "Build Semantic Metadata", href: "/admin/build-semantic-metadata" },
-      ],
-      "/admin/view-semantic-metadata": [
-        { text: "Home", href: "/" },
-        { text: "Admin Dashboard", href: "/admin" },
-        { text: "View Semantic RAG Metadata", href: "/admin/view-semantic-metadata" },
       ],
       "/admin/build-graph": [
         { text: "Home", href: "/" },
@@ -179,7 +165,7 @@ function AppContent({ signOut, user }) {
                 type: "section",
                 text: "Admin",
                 items: [
-                  { type: "link", text: "Semantic Metadata", href: "/admin" },
+                  { type: "link", text: "Semantic Knowledge Base", href: "/admin" },
 
                 ],
               },
@@ -229,15 +215,7 @@ function AppContent({ signOut, user }) {
             />
             <Route
               path="/admin/select-semantic-layer-type/:id"
-              element={<SelectSemanticLayerType enableOntologyAgents={ENABLE_ONTOLOGY_AGENTS} />}
-            />
-            <Route
-              path="/admin/build-semantic-metadata/:id"
-              element={<BuildSemanticMetadata />}
-            />
-            <Route
-              path="/admin/view-semantic-metadata/:id"
-              element={<ViewSemanticRAGMetadata />}
+              element={<SelectSemanticLayerType />}
             />
             <Route
               path="/admin/build-graph"

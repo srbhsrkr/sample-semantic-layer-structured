@@ -2,18 +2,16 @@ import * as cdk from 'aws-cdk-lib';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
-import { DynamoDBDataLoader } from './dynamodb/data-loader-construct';
-import * as path from 'path';
 
 export interface DynamoDBStackProps extends cdk.StackProps {
   projectName: string;
-  loadSyntheticData?: boolean; // Whether to load synthetic data on deployment
 }
 
 /**
  * DynamoDB Stack
- * Creates separate DynamoDB tables for each dataset in complete_synthetic_data
- * Based on the synthetic data structure from SYNTHETIC_DATA_README.md
+ * Creates one operational table per insurance domain entity. Tables are created
+ * empty; load your own data (e.g. via the AWS CLI/SDK or an ETL job) using the
+ * pk/sk composite-key schema below.
  */
 export class DynamoDBStack extends cdk.Stack {
   // Individual tables for each dataset
@@ -187,46 +185,9 @@ export class DynamoDBStack extends cdk.Stack {
       exportName: `${props.projectName}-athena-dynamodb-role-arn`,
     });
 
-    // Load synthetic data if requested - each dataset into its own table
-    if (props.loadSyntheticData) {
-      const dataPath = path.join(__dirname, '../../../../data/complete_synthetic_data');
-
-      // Map each dataset file to its corresponding table
-      const datasetMappings = [
-        { table: this.typeCodesTable, filename: 'type_codes.json', displayName: 'Type Codes' },
-        { table: this.adminCodesTable, filename: 'admin_codes.json', displayName: 'Admin Codes' },
-        { table: this.policyProductsTable, filename: 'policy_products.json', displayName: 'Policy Products' },
-        { table: this.coverageProductsTable, filename: 'coverage_products.json', displayName: 'Coverage Products' },
-        { table: this.investProductsTable, filename: 'invest_products.json', displayName: 'Investment Products' },
-        { table: this.partiesTable, filename: 'parties.json', displayName: 'Parties' },
-        { table: this.coveragesTable, filename: 'coverages.json', displayName: 'Coverages' },
-        { table: this.holdingsTable, filename: 'holdings.json', displayName: 'Holdings' },
-        { table: this.financialActivitiesTable, filename: 'financial_activities.json', displayName: 'Financial Activities' },
-        { table: this.financialStatementsTable, filename: 'financial_statements.json', displayName: 'Financial Statements' },
-        { table: this.ridersTable, filename: 'riders.json', displayName: 'Riders' },
-        { table: this.relationsTable, filename: 'relations.json', displayName: 'Relations' },
-      ];
-
-      // Create a data loader for each dataset/table pair
-      datasetMappings.forEach(({ table, filename, displayName }) => {
-        new DynamoDBDataLoader(this, `${displayName.replace(/\s+/g, '')}Loader`, {
-          table: table,
-          dataPath: dataPath,
-          dataFiles: [{ filename, displayName }],
-          autoLoad: true,
-        });
-      });
-
-      cdk.Annotations.of(this).addInfo(
-        'Synthetic data will be loaded automatically during deployment into separate tables. ' +
-        'This may take 10-15 minutes for ~11MB of data across 12 tables.'
-      );
-    } else {
-      cdk.Annotations.of(this).addWarning(
-        'Synthetic data loading is disabled. ' +
-        'Run scripts/load_to_dynamodb.py manually to load data, or ' +
-        `enable by setting loadSyntheticData: true in the stack props.`
-      );
-    }
+    cdk.Annotations.of(this).addInfo(
+      'DynamoDB tables are created empty. Load your own data into these tables ' +
+      '(using the pk/sk composite-key schema) before building the semantic layer.'
+    );
   }
 }

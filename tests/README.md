@@ -55,7 +55,7 @@ This conftest is loaded automatically by pytest for all tests under `tests/unit/
 
 **All unit tests via pytest (recommended):**
 ```bash
-cd /Users/huthmac/Documents/AWS/00_workspace/semantic-layer
+cd <repo-root>
 pytest tests/unit/ -v
 ```
 
@@ -174,7 +174,7 @@ Tests the Virtual KG query workflow against real Athena tables.
 
 **Run:**
 ```bash
-cd /Users/huthmac/Documents/AWS/00_workspace/semantic-layer
+cd <repo-root>
 
 export AWS_REGION=us-east-1
 export TEST_DATABASE=your_database_name
@@ -203,7 +203,7 @@ Tests ontology generation workflow against real Athena and S3.
 
 **Run:**
 ```bash
-cd /Users/huthmac/Documents/AWS/00_workspace/semantic-layer
+cd <repo-root>
 
 export AWS_REGION=us-east-1
 export TEST_DATABASE=your_glue_database

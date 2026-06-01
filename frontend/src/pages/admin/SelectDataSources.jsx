@@ -400,7 +400,7 @@ export default function SelectDataSources({ user }) {
         }
       >
         <FormField
-          description="Upload existing semantic metadata, taxonomies, data dictionaries, or any documentation that provides context about your data sources"
+          description="Upload existing ontologies, taxonomies, data dictionaries, or any documentation that provides context about your data sources"
         >
           <FileUpload
             value={ontologyFile}

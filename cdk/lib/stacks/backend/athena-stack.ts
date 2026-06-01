@@ -37,6 +37,7 @@ export class AthenaStack extends cdk.Stack {
   public readonly dynamodbConnectorFunction: lambda.IFunction;
   public readonly dynamodbCatalog: athena.CfnDataCatalog;
   public readonly spillBucket: s3.Bucket;
+  public readonly spillEncryptionKey: kms.IKey;
 
   constructor(scope: Construct, id: string, props: AthenaStackProps) {
     super(scope, id, props);
@@ -164,10 +165,12 @@ export class AthenaStack extends cdk.Stack {
       enableKeyRotation: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
+    this.spillEncryptionKey = encryptionKey;
 
-    // Create spill bucket for query results that exceed Lambda memory
+    // Create spill bucket for query results that exceed Lambda memory.
+    // Account+region suffix avoids global S3 namespace collisions.
     this.spillBucket = new s3.Bucket(this, 'SpillBucket', {
-      bucketName: `${connectorName}-spill`,
+      bucketName: `${connectorName}-spill-${this.account}-${this.region}`,
       encryptionKey: encryptionKey,
       bucketKeyEnabled: true, // Reduce KMS costs
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,

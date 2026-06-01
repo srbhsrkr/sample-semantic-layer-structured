@@ -30,6 +30,7 @@ class GlueService:
         )
         self.glue_client = boto3.client('glue', config=config)
         self._s3t_client = boto3.client('s3tables', config=config)
+        self._athena_client = boto3.client('athena', config=config)
         # Cache: bucket-name → ARN, populated lazily by _bucket_arn()
         self._bucket_arn_cache: Dict[str, str] = {}
         # Cache: bucket-ARN → PyIceberg RestCatalog instance
@@ -336,6 +337,102 @@ class GlueService:
         logger.info(f"Discovered federated catalog IDs: {catalog_ids}")
         return catalog_ids
 
+    def _discover_athena_lambda_catalogs(self) -> List[str]:
+        """
+        Enumerate Athena data catalogs of Type=LAMBDA (federated connectors).
+
+        These are registered Athena data sources that delegate to a connector
+        Lambda — e.g. the DynamoDB connector exposed as 'dynamodb_catalog'.
+        They are not visible via Glue's get_catalogs and must be queried
+        through the Athena APIs.
+
+        Returns:
+            List of Athena catalog names (e.g. ['dynamodb_catalog']).
+        """
+        catalog_names: List[str] = []
+        try:
+            paginator = self._athena_client.get_paginator('list_data_catalogs')
+            for page in paginator.paginate():
+                for catalog in page.get('DataCatalogsSummary', []):
+                    if catalog.get('Type') == 'LAMBDA':
+                        catalog_names.append(catalog['CatalogName'])
+        except Exception as e:
+            logger.warning(f"Athena catalog discovery unavailable (list_data_catalogs): {e}")
+        logger.info(f"Discovered Athena Lambda catalogs: {catalog_names}")
+        return catalog_names
+
+    def _list_athena_tables(self, database_name: str, catalog_id: str) -> List[Dict[str, Any]]:
+        """
+        List tables in an Athena Lambda data catalog (e.g. dynamodb_catalog).
+
+        Glue's get_tables doesn't see federated Lambda catalogs; the metadata
+        lives behind the connector Lambda and is exposed only via
+        athena.list_table_metadata.
+        """
+        tables: List[Dict[str, Any]] = []
+        try:
+            paginator = self._athena_client.get_paginator('list_table_metadata')
+            for page in paginator.paginate(CatalogName=catalog_id, DatabaseName=database_name):
+                for table in page.get('TableMetadataList', []):
+                    tables.append({
+                        'name': table['Name'],
+                        'databaseName': database_name,
+                        'catalogId': catalog_id,
+                        'dataSource': self._data_source_for_catalog(catalog_id),
+                        'description': table.get('Parameters', {}).get('comment', ''),
+                        'location': '',
+                        'columns': len(table.get('Columns', [])),
+                        'createTime': table.get('CreateTime').isoformat() if table.get('CreateTime') else None,
+                        'updateTime': table.get('LastAccessTime').isoformat() if table.get('LastAccessTime') else None,
+                        'tableType': table.get('TableType', 'EXTERNAL_TABLE'),
+                    })
+        except ClientError as e:
+            logger.warning(f"Error listing Athena tables in '{catalog_id}.{database_name}': {e}")
+            return []
+        logger.info(f"Listed {len(tables)} Athena tables in '{catalog_id}.{database_name}'")
+        return tables
+
+    def _get_athena_table_metadata(self, database_name: str, table_name: str, catalog_id: str) -> Dict[str, Any]:
+        """
+        Fetch full metadata for one table in an Athena Lambda catalog.
+        """
+        response = self._athena_client.get_table_metadata(
+            CatalogName=catalog_id,
+            DatabaseName=database_name,
+            TableName=table_name,
+        )
+        table = response['TableMetadata']
+        columns = [
+            {'name': col['Name'], 'type': col['Type'], 'comment': col.get('Comment', '')}
+            for col in table.get('Columns', [])
+        ]
+        partition_keys = [
+            {'name': pk['Name'], 'type': pk['Type'], 'comment': pk.get('Comment', '')}
+            for pk in table.get('PartitionKeys', [])
+        ]
+        return {
+            'name': table['Name'],
+            'databaseName': database_name,
+            'catalogId': catalog_id,
+            'dataSource': self._data_source_for_catalog(catalog_id),
+            'description': table.get('Parameters', {}).get('comment', ''),
+            'owner': '',
+            'createTime': table.get('CreateTime').isoformat() if table.get('CreateTime') else None,
+            'updateTime': table.get('LastAccessTime').isoformat() if table.get('LastAccessTime') else None,
+            'lastAccessTime': table.get('LastAccessTime').isoformat() if table.get('LastAccessTime') else None,
+            'retention': 0,
+            'tableType': table.get('TableType', 'EXTERNAL_TABLE'),
+            'parameters': table.get('Parameters', {}),
+            'location': '',
+            'inputFormat': '',
+            'outputFormat': '',
+            'compressed': False,
+            'numberOfBuckets': 0,
+            'serdeInfo': {},
+            'columns': columns,
+            'partitionKeys': partition_keys,
+        }
+
     def list_databases(self) -> List[Dict[str, Any]]:
         """
         List all non-empty Glue databases across all catalogs.
@@ -359,14 +456,44 @@ class GlueService:
             # Default AWSDataCatalog
             for page in paginator.paginate():
                 for db in page.get('DatabaseList', []):
+                    db_name = db['Name']
+                    # Skip the DynamoDB-crawler-registered database. Tables there have
+                    # Location=arn:aws:dynamodb:... which Athena cannot resolve, so any
+                    # ontology built against it fails at SQL execution. Real-time CDC
+                    # (semantic_layer_iceberg) and Zero-ETL (normalized) S3 Tables
+                    # namespaces expose the same data in queryable form.
+                    if db_name.endswith('_dynamodb'):
+                        logger.debug(f"Skipping DynamoDB-crawler database '{db_name}' (unqueryable via Athena)")
+                        continue
                     all_databases.append({
-                        'name': db['Name'],
+                        'name': db_name,
                         'catalogId': 'AWSDataCatalog',
                         'dataSource': self._data_source_for_catalog('AWSDataCatalog'),
                         'description': db.get('Description', ''),
                         'location': db.get('LocationUri', ''),
                         'createTime': db.get('CreateTime').isoformat() if db.get('CreateTime') else None,
                     })
+
+            # Athena Lambda data catalogs (e.g. dynamodb_catalog) — federated connectors
+            # registered as Athena data sources rather than Glue catalogs. They expose
+            # otherwise-unqueryable sources (DynamoDB, JDBC, etc.) through Athena's
+            # federation Lambda. Enumerated via Athena APIs because get_catalogs only
+            # walks the Glue side.
+            for catalog_id in self._discover_athena_lambda_catalogs():
+                try:
+                    db_paginator = self._athena_client.get_paginator('list_databases')
+                    for page in db_paginator.paginate(CatalogName=catalog_id):
+                        for db in page.get('DatabaseList', []):
+                            all_databases.append({
+                                'name': db['Name'],
+                                'catalogId': catalog_id,
+                                'dataSource': self._data_source_for_catalog(catalog_id),
+                                'description': db.get('Description', ''),
+                                'location': '',
+                                'createTime': None,
+                            })
+                except ClientError as e:
+                    logger.warning(f"Could not list databases for Athena catalog '{catalog_id}': {e}")
 
             # Dynamically discovered federated catalogs (e.g. s3tablescatalog/<bucket>)
             for catalog_id in self._discover_catalog_ids():
@@ -446,6 +573,12 @@ class GlueService:
         if catalog_id and catalog_id.startswith('s3tablescatalog/'):
             return self._list_s3tables(database_name, catalog_id, enrich=enrich)
 
+        # Athena Lambda data catalogs (e.g. dynamodb_catalog) — Glue cannot enumerate
+        # these either; their metadata is fronted by the connector Lambda and only
+        # exposed through Athena's metadata APIs.
+        if catalog_id and catalog_id not in ('AWSDataCatalog', 'AwsDataCatalog') and not catalog_id.startswith('s3tablescatalog/'):
+            return self._list_athena_tables(database_name, catalog_id)
+
         try:
             tables = []
             paginator = self.glue_client.get_paginator('get_tables')
@@ -487,6 +620,11 @@ class GlueService:
         Returns:
             Dictionary containing table metadata including schema, partitions, and statistics
         """
+        # Athena Lambda data catalogs: metadata sits behind the connector Lambda
+        # and is unreachable via Glue. Route to athena.get_table_metadata.
+        if catalog_id and catalog_id not in ('AWSDataCatalog', 'AwsDataCatalog') and not catalog_id.startswith('s3tablescatalog/'):
+            return self._get_athena_table_metadata(database_name, table_name, catalog_id)
+
         try:
             get_kwargs: Dict[str, Any] = {
                 'DatabaseName': database_name,

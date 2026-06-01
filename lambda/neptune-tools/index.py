@@ -217,10 +217,34 @@ def tool_get_ontology_from_neptune(ontology_id: str) -> str:
                 # Parse OWL classes and properties
                 if predicate == 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type':
                     if obj == 'http://www.w3.org/2002/07/owl#Class':
-                        ontology_info['classes'][subject] = {}
+                        ontology_info['classes'].setdefault(subject, {})
                     elif obj in ['http://www.w3.org/2002/07/owl#DatatypeProperty',
                                  'http://www.w3.org/2002/07/owl#ObjectProperty']:
-                        ontology_info['properties'][subject] = {'type': obj}
+                        existing = ontology_info['properties'].setdefault(subject, {})
+                        existing['type'] = obj
+
+                # rdfs:label / rdfs:comment — without these the schema digest
+                # consumed by the query agent's column picker is empty, which
+                # collapses Pick-2 to surface-level table-name matching.
+                elif predicate in (
+                    'http://www.w3.org/2000/01/rdf-schema#label',
+                    'http://www.w3.org/2000/01/rdf-schema#comment',
+                ):
+                    field = (
+                        'label'
+                        if predicate.endswith('#label')
+                        else 'comment'
+                    )
+                    if subject in ontology_info['classes']:
+                        ontology_info['classes'][subject][field] = obj
+                    elif subject in ontology_info['properties']:
+                        ontology_info['properties'][subject][field] = obj
+                    else:
+                        # Type triple hasn't been seen yet (rare given ORDER BY,
+                        # but defensive). Park on properties; a later type=Class
+                        # will leave this entry under properties — acceptable
+                        # because the digest reads from both buckets.
+                        ontology_info['properties'].setdefault(subject, {})[field] = obj
 
                 # Parse database metadata triple written at ontology level
                 elif predicate == f'{VIRTUAL_KG_VOCAB}hasDatabase':

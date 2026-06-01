@@ -14,7 +14,7 @@ import os
 import re
 import uuid
 from typing import Dict, Any, List, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import io
 import boto3
@@ -419,6 +419,13 @@ class OntologyService:
                     'status': 'not_found'
                 }
 
+            # Watchdog: AgentCore runs the build in a daemon thread that dies silently
+            # when the runtime container is reclaimed, leaving the row stuck on
+            # 'processing' / 'pending' indefinitely.  If updatedAt has not advanced for
+            # ONTOLOGY_BUILD_STALE_MINUTES (default 30), flip to 'failed' on next read
+            # so the UI can surface the failure and the user can retry.
+            config = self._reap_if_stale(config)
+
             # Build response with progress tracking fields
             response = {
                 'id': id,
@@ -443,6 +450,78 @@ class OntologyService:
         except Exception as e:
             logger.warning(f"Error getting build status: {e}", exc_info=True)
             raise
+
+    def _reap_if_stale(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Lazy watchdog: if a build row is in an in-flight status but has not
+        progressed for ONTOLOGY_BUILD_STALE_MINUTES (default 30), flip it to
+        'failed' so the UI can recover and the user can retry.
+
+        The agent runs the build in a daemon thread inside AgentCore Runtime.
+        When the container is reclaimed mid-build the thread dies without
+        running its except/finally, so DynamoDB stays in 'processing' forever.
+        Every progress update writes updatedAt — treating that as a heartbeat
+        gives us a reliable "no progress" signal without a separate cron.
+        """
+        in_flight = {'pending', 'processing'}
+        if config.get('status') not in in_flight:
+            return config
+
+        updated_at = config.get('updatedAt')
+        if not updated_at:
+            return config
+
+        try:
+            last = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+        except (ValueError, AttributeError):
+            return config
+
+        threshold = timedelta(
+            minutes=int(os.environ.get('ONTOLOGY_BUILD_STALE_MINUTES', '30'))
+        )
+        if datetime.now(timezone.utc) - last < threshold:
+            return config
+
+        logger.warning(
+            f"Build row {config.get('id')} (version={config.get('version')}) "
+            f"stuck in '{config.get('status')}' since {updated_at} — marking failed"
+        )
+        try:
+            now = datetime.now(timezone.utc).isoformat()
+            self.table.update_item(
+                Key={'id': config['id'], 'version': config['version']},
+                UpdateExpression=(
+                    "SET #s = :failed, #e = :err, failedAt = :now, updatedAt = :now"
+                ),
+                ConditionExpression="#s IN (:pending, :processing)",
+                ExpressionAttributeNames={'#s': 'status', '#e': 'error'},
+                ExpressionAttributeValues={
+                    ':failed': 'failed',
+                    ':err': (
+                        f"Build timed out — no progress for "
+                        f"{threshold.total_seconds() / 60:.0f}+ minutes"
+                    ),
+                    ':pending': 'pending',
+                    ':processing': 'processing',
+                    ':now': now,
+                },
+            )
+            config['status'] = 'failed'
+            config['error'] = (
+                f"Build timed out — no progress for "
+                f"{threshold.total_seconds() / 60:.0f}+ minutes"
+            )
+            config['failedAt'] = now
+            config['updatedAt'] = now
+        except ClientError as e:
+            if e.response['Error'].get('Code') == 'ConditionalCheckFailedException':
+                # Agent finished between our read and write — re-fetch the truth.
+                fresh = self._get_versioned_config(config['id'], config['version'])
+                if fresh:
+                    return fresh
+            else:
+                logger.warning(f"Failed to mark stuck build as failed: {e}")
+        return config
 
     def _get_versioned_config(self, id: str, version: str) -> Optional[Dict[str, Any]]:
         """

@@ -17,6 +17,8 @@ export interface NormalizedViewsStackProps extends cdk.StackProps {
   dataLakeStack: DataLakeStack;
   zeroEtlStack: ZeroEtlStack;
   refreshIntervalHours?: number; // default 6
+  /** Additional principals (human/SSO roles) to retain as LF admins across redeploys. */
+  additionalLakeFormationAdmins?: string[];
 }
 
 export class NormalizedViewsStack extends cdk.Stack {
@@ -143,41 +145,36 @@ export class NormalizedViewsStack extends cdk.Stack {
       ]),
     });
 
-    // ── Lake Formation grants on source zetl_* namespaces ───────────────────
-    // All known zetl_* namespaces — each Zero-ETL redeployment creates new UUIDs.
-    // LF grants must cover every namespace the Glue job may read from (job picks newest).
-    // Add new entries here after redeployments; old entries are harmless.
-    const ZETL_NAMESPACES: string[] = [
-      // Batch 4 (redeploy 2026-04-01, semantic-layer-dev)
-      'zetl_0fcf456c_5821_4739_b594_32fb42d80a73',
-      'zetl_14335b80_396f_4c30_913c_444902e5cb10',
-      'zetl_16c76f57_3905_45da_93ed_3c1d4b72f196',
-      'zetl_351f3256_dff1_4045_9238_5ec8abcbf944',
-      'zetl_7698428a_bd2b_4dc4_90c6_ac47ce2d5871',
-      'zetl_8ee52339_f1e1_4d73_99f1_06e79c97b2bd',
-      'zetl_946f6685_d7c2_400f_a145_08f37153b24e',
-      'zetl_b5a644dd_474a_4b13_bd3a_358d99d4dc9f',
-      'zetl_cc86f78a_2d5a_4643_811f_6c6262cf28a4',
-      'zetl_e3a58232_3570_4de4_a16b_3410c53b2f2c',
-      'zetl_ebdc9373_f923_48e7_af6a_929ecca1a237',
-      'zetl_f644c442_482d_440f_a282_b1e5d4de25d9',
-    ];
-
+    // ── Lake Formation access on source zetl_* namespaces ───────────────────
+    // lakeformation:GrantPermissions on s3tablescatalog/<bucket> federated
+    // sub-catalog databases fails — the API rejects it with
+    // "Insufficient Glue permissions to access database". The only working
+    // pattern (per lambda-rest-api/index.ts:246) is to register the consuming
+    // role as a Lake Formation admin, which grants implicit SELECT on every
+    // database in s3tablescatalog. This applies here: the MV job role reads
+    // 12 zetl_<uuid> namespaces whose UUIDs change every deploy, so blanket
+    // admin access is the right scope anyway.
     const s3tCatalogId = `${this.account}:s3tablescatalog/${bucketName}`;
 
-    ZETL_NAMESPACES.forEach((zetlNs, i) => {
-      new lakeformation.CfnPermissions(this, `LFSourceGrant${i}`, {
-        dataLakePrincipal: { dataLakePrincipalIdentifier: jobRole.roleArn },
-        resource: {
-          tableResource: {
-            catalogId: s3tCatalogId,
-            databaseName: zetlNs,
-            tableWildcard: {},
-          },
+    // Register the MV job role as an LF admin so it can read all zetl_<uuid>
+    // namespaces under s3tablescatalog. Carries forward all prior admins
+    // because CfnDataLakeSettings is last-writer-wins.
+    const lfAdminSettings = new lakeformation.CfnDataLakeSettings(this, 'NormalizedViewsLFAdminSettings', {
+      admins: [
+        {
+          dataLakePrincipalIdentifier: `arn:aws:iam::${this.account}:role/cdk-hnb659fds-cfn-exec-role-${this.account}-${this.region}`,
         },
-        permissions: ['SELECT'],
-      });
+        {
+          dataLakePrincipalIdentifier: `arn:aws:iam::${this.account}:role/cdk-hnb659fds-deploy-role-${this.account}-${this.region}`,
+        },
+        { dataLakePrincipalIdentifier: props.dataLakeStack.lfGrantSingletonRoleArn },
+        { dataLakePrincipalIdentifier: jobRole.roleArn },
+        ...(props.additionalLakeFormationAdmins ?? []).map((arn) => ({
+          dataLakePrincipalIdentifier: arn,
+        })),
+      ],
     });
+    lfAdminSettings.node.addDependency(props.zeroEtlStack);
 
     // Grant CREATE_TABLE on the target 'normalized' namespace
     const lfNormalizedGrant = new lakeformation.CfnPermissions(this, 'LFNormalizedDbGrant', {
@@ -262,5 +259,45 @@ export class NormalizedViewsStack extends cdk.Stack {
         },
       })
     );
+
+    // ── Initial run on deploy ────────────────────────────────────────────────
+    // The schedule rule fires every refreshHours, so without this a fresh
+    // deploy leaves the 'normalized' namespace empty until the first scheduled
+    // tick (up to refreshHours later). Fire-and-forget StartJobRun on Create
+    // populates it immediately. The LF admin registration above ensures the
+    // job role can read all zetl_* namespaces before the first invocation.
+    const initialRun = new cr.AwsCustomResource(this, 'InitialJobRun', {
+      onCreate: {
+        service: 'Glue',
+        action: 'startJobRun',
+        parameters: {
+          JobName: glueJob.ref,
+          Arguments: {
+            '--table_bucket_name': bucketName,
+            '--account_id': this.account,
+            '--region': this.region,
+            '--refresh_hours': String(refreshHours),
+          },
+        },
+        physicalResourceId: cr.PhysicalResourceId.of(`${glueJob.ref}-initial-run`),
+        // ConcurrentRunsExceededException: schedule rule already fired; skip.
+        ignoreErrorCodesMatching: 'ConcurrentRunsExceededException',
+      },
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: ['glue:StartJobRun'],
+          resources: [`arn:aws:glue:${this.region}:${this.account}:job/${glueJob.ref}`],
+        }),
+      ]),
+    });
+    initialRun.node.addDependency(glueJob);
+    initialRun.node.addDependency(lfAdminSettings);
+    initialRun.node.addDependency(lfNormalizedGrant);
+
+    NagSuppressions.addResourceSuppressions(initialRun, [
+      { id: 'AwsSolutions-IAM4', reason: 'AWSLambdaBasicExecutionRole used by AwsCustomResource framework' },
+      { id: 'AwsSolutions-IAM5', reason: 'AwsCustomResource framework wildcard scoped to its own Lambda' },
+      { id: 'AwsSolutions-L1', reason: 'AwsCustomResource framework Lambda runtime is library-controlled' },
+    ], true);
   }
 }

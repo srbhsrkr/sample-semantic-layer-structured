@@ -22,13 +22,11 @@ import { AwsSolutionsChecks, NagSuppressions } from 'cdk-nag';
 import { NetworkingStack } from '../lib/stacks/backend/networking-stack';
 import { DynamoDBStack } from '../lib/stacks/backend/dynamodb-stack';
 import { DataLakeStack } from '../lib/stacks/backend/data-lake-stack';
-import { DynamoDBStreamProcessorStack } from '../lib/stacks/backend/dynamodb-stream-processor-stack';
 import { GlueCatalogStack } from '../lib/stacks/backend/glue-catalog-stack';
 import { NeptuneStack } from '../lib/stacks/backend/neptune-stack';
 import { BedrockKnowledgeBaseStack } from '../lib/stacks/backend/bedrock-kb-stack';
 import { AthenaStack } from '../lib/stacks/backend/athena-stack';
 import { AgentCoreStack } from '../lib/stacks/backend/agentcore-stack';
-import { AgentCoreEvalStack } from '../lib/stacks/backend/agentcore-eval-stack';
 import { FrontendStack } from '../lib/stacks/frontend';
 import { CloudFrontStorageStack } from '../lib/stacks/frontend/cloudfront-storage';
 import { AuthStack } from '../lib/stacks/backend/auth';
@@ -47,6 +45,13 @@ const env = {
 
 const projectName = 'semantic-layer';
 
+// Human/SSO roles that must retain LF admin status across all CDK redeploys.
+// Passed to every stack that owns a CfnDataLakeSettings so none are silently dropped.
+// Add any IAM role ARN that needs to browse s3tablescatalog in the Glue/Athena console.
+const additionalLakeFormationAdmins = [
+  `arn:aws:iam::${process.env.CDK_DEFAULT_ACCOUNT}:role/Admin`,
+];
+
 // Optional deployment suffix — allows multiple independent deployments in the same account/region.
 // Usage: cdk deploy --context suffix=v2
 // Stack names become: semantic-layer-v2-networking, semantic-layer-v2-dynamodb, etc.
@@ -55,22 +60,7 @@ const projectName = 'semantic-layer';
 const suffix = (app.node.tryGetContext('suffix') as string | undefined) ?? 'dev';
 const deployName = `${projectName}-${suffix}`;
 
-// Feature flag: set to false to skip Neptune, ontology KB, Neptune Gateway, and VKG agents
-// Note: --context values are always strings, so we check for both boolean false and string 'false'
-const _ontologyCtx = app.node.tryGetContext('enableOntologyAgents');
-const enableOntologyAgents = _ontologyCtx !== false && _ontologyCtx !== 'false';
-
-// CDC pipeline mode flags — mutually exclusive replication strategies.
-//   enableRealtimeReplication (default true)  → DynamoDB Streams + Lambda PyIceberg CDC
-//   enableBatchReplication    (default false) → Glue Zero-ETL integrations to S3 Tables
-// Pass via CDK context to override defaults:
-//   cdk deploy --context enableRealtimeReplication=false --context enableBatchReplication=true
-const _realtimeCtx = app.node.tryGetContext('enableRealtimeReplication');
-const enableRealtimeReplication = _realtimeCtx !== false && _realtimeCtx !== 'false';
-
-const _batchCtx = app.node.tryGetContext('enableBatchReplication');
-const enableBatchReplication = _batchCtx === true || _batchCtx === 'true';
-
+// VKG-only customer build: VKG agents always on, batch Zero-ETL replication only.
 // 1. Networking Stack - VPC for Neptune and private resources
 const networkingStack = new NetworkingStack(app, `${deployName}-networking`, {
   env,
@@ -83,7 +73,6 @@ const dynamodbStack = new DynamoDBStack(app, `${deployName}-dynamodb`, {
   env,
   description: 'DynamoDB tables for insurance operational data',
   projectName: deployName,
-  loadSyntheticData: true, // Set to false to skip automatic data loading
 });
 
 // 3. Glue Catalog Stack - Schema discovery and Iceberg database
@@ -95,82 +84,52 @@ const glueCatalogStack = new GlueCatalogStack(app, `${deployName}-glue-catalog`,
   autoStartCrawlers: true, // Auto-start DynamoDB crawler on deployment
 });
 
-// 4. Data Lake Stack - S3 Tables (Iceberg) for real-time analytics
+// 4. Data Lake Stack - S3 Tables (Iceberg) for analytics
 const dataLakeStack = new DataLakeStack(app, `${deployName}-data-lake`, {
   env,
-  description: 'S3 Tables data lake for real-time analytics with DynamoDB CDC',
+  description: 'S3 Tables data lake for analytics fed by Glue Zero-ETL',
   projectName: deployName,
   glueCatalogStack,
-  enableRealtimeReplication,
 });
 
-// 5. CDC Pipeline — choose between real-time (Streams) or batch (Zero-ETL) replication.
-//    Default: real-time. Override via CDK context flags (see feature flags above).
-const streamProcessorStack = enableRealtimeReplication
-  ? new DynamoDBStreamProcessorStack(app, `${deployName}-stream-processor`, {
-      env,
-      description: 'DynamoDB Streams to S3 Tables CDC pipeline',
-      projectName: deployName,
-      dynamodbStack,
-      dataLakeStack,
-    })
-  : undefined;
+// 5. Zero-ETL Stack — DynamoDB → S3 Tables batch replication
+const zeroEtlStack = new ZeroEtlStack(app, `${deployName}-zeroetl`, {
+  env,
+  description: 'Glue Zero-ETL integrations from DynamoDB tables to S3 Tables',
+  projectName: deployName,
+  dynamodbStack,
+  tableBucketArn: dataLakeStack.tableBucketArn,
+  tableBucketName: dataLakeStack.tableBucketName,
+  tableBucketNamespace: dataLakeStack.namespace,
+});
 
-const zeroEtlStack = enableBatchReplication
-  ? new ZeroEtlStack(app, `${deployName}-zeroetl`, {
-      env,
-      description: 'Glue Zero-ETL integrations from DynamoDB tables to S3 Tables',
-      projectName: deployName,
-      dynamodbStack,
-      tableBucketArn: dataLakeStack.tableBucketArn,
-      tableBucketName: dataLakeStack.tableBucketName,
-      tableBucketNamespace: dataLakeStack.namespace,
-    })
-  : undefined;
+// 6. Normalized Views Stack — 40 Glue materialized views in 'normalized' S3 Tables namespace
+const normalizedViewsStack = new NormalizedViewsStack(app, `${deployName}-normalized-views`, {
+  env,
+  description: 'Glue materialized views normalizing Zero-ETL S3 Tables into entity tables',
+  projectName: deployName,
+  dataLakeStack,
+  zeroEtlStack,
+  refreshIntervalHours: 6,
+  additionalLakeFormationAdmins,
+});
 
-// 6. Normalized Views Stack — only when enableBatchReplication=true (cdk.json)
-// Creates 40 Glue materialized views in 'normalized' S3 Tables namespace
-const normalizedViewsStack =
-  enableBatchReplication && zeroEtlStack
-    ? new NormalizedViewsStack(app, `${deployName}-normalized-views`, {
-        env,
-        description: 'Glue materialized views normalizing Zero-ETL S3 Tables into entity tables',
-        projectName: deployName,
-        dataLakeStack,
-        zeroEtlStack,
-        refreshIntervalHours: 6,
-      })
-    : undefined;
+// 7. Neptune Stack - Knowledge graph for semantic ontology (VKG)
+const neptuneStack = new NeptuneStack(app, `${deployName}-neptune`, {
+  env,
+  description: 'Amazon Neptune RDF graph database for ontology',
+  projectName: deployName,
+  vpc: networkingStack.vpc,
+});
 
-// 7. Neptune Stack - Knowledge graph for semantic ontology (conditional)
-const neptuneStack = enableOntologyAgents
-  ? new NeptuneStack(app, `${deployName}-neptune`, {
-      env,
-      description: 'Amazon Neptune RDF graph database for ontology',
-      projectName: deployName,
-      vpc: networkingStack.vpc,
-    })
-  : undefined;
-
-// 8. Bedrock Knowledge Base Stack - always deployed.
-// Both KBs (ontology patterns + semantic RAG) are required by the metadata, metadata-query,
-// and query-suggestions agents regardless of the ontology flag.  The ontology generation
-// agent also reads from the ontology-patterns KB, but that code path is gated by ontologyEnabled
-// inside AgentCoreStack rather than here.
+// 8. Bedrock Knowledge Base Stack — ontology-patterns KB consumed by the ontology generation agent
 const bedrockKbStack = new BedrockKnowledgeBaseStack(app, `${deployName}-bedrock-kb`, {
   env,
-  description: 'Amazon Bedrock Knowledge Base for ontology patterns and semantic RAG',
+  description: 'Amazon Bedrock Knowledge Base for ontology patterns',
   projectName: deployName,
   artifactsBucket: dataLakeStack.artifactsBucket,
   autoStartIngestion: true,
 });
-
-// Human/SSO roles that must retain LF admin status across all CDK redeploys.
-// Passed to every stack that owns a CfnDataLakeSettings so none are silently dropped.
-// Add any IAM role ARN that needs to browse s3tablescatalog in the Glue/Athena console.
-const additionalLakeFormationAdmins = [
-  `arn:aws:iam::${process.env.CDK_DEFAULT_ACCOUNT}:role/Admin`,
-];
 
 // 9. Athena Stack - Federated query engine
 const athenaStack = new AthenaStack(app, `${deployName}-athena`, {
@@ -184,34 +143,22 @@ const athenaStack = new AthenaStack(app, `${deployName}-athena`, {
   additionalLakeFormationAdmins,
 });
 
-// 11. AgentCore Stack - Strands agents on Bedrock AgentCore Runtime
+// 11. AgentCore Stack - Strands agents (ontology + ontology-query) on Bedrock AgentCore Runtime
 const agentcoreStack = new AgentCoreStack(app, `${deployName}-agentcore`, {
   env,
   description: 'Bedrock AgentCore Runtime with Strands agents',
   projectName: deployName,
   vpc: networkingStack.vpc,
-  neptuneStack, // undefined when flag off
-  bedrockKbStack, // always present
+  neptuneStack,
+  bedrockKbStack,
   glueCatalogStack,
   dynamodbStack,
   athenaStack,
   dataLakeStack,
   additionalLakeFormationAdmins,
-  normalizedViewsEnabled: enableBatchReplication,
-  enableRealtimeReplication,
 });
 
-// 12. AgentCore Eval Stack - Online evaluation configs for all 5 runtimes
-const agentcoreEvalStack = new AgentCoreEvalStack(app, `${deployName}-agentcore-eval`, {
-  env,
-  description: 'AgentCore Evaluations online eval configs for all 5 runtimes',
-  projectName: deployName,
-  agentCoreStack: agentcoreStack,
-  samplingRate: 100,
-});
-agentcoreEvalStack.addDependency(agentcoreStack);
-
-// 13. CloudFront Storage Stack - Create CloudFront distribution and S3 bucket FIRST
+// 12. CloudFront Storage Stack - Create CloudFront distribution and S3 bucket FIRST
 // This allows the CloudFront URL to be used in Cognito callback URLs
 const cloudfrontStorageStack = new CloudFrontStorageStack(app, `${deployName}-cloudfront-storage`, {
   env,
@@ -248,12 +195,9 @@ const lambdaApiStack = new LambdaRestApiStack(app, `${deployName}-lambda-api`, {
   artifactsBucket: dataLakeStack.artifactsBucket,
   // Ontology metadata table
   ontologyMetadataTable: dynamodbStack.metadataTable,
-  // AgentCore Runtime ARNs
-  ontologyRuntimeArn: agentcoreStack.ontologyRuntimeArn, // undefined when flag off
-  queryRuntimeArn: agentcoreStack.queryRuntimeArn, // undefined when flag off
-  metadataRuntimeArn: agentcoreStack.metadataRuntimeArn,
-  metadataQueryRuntimeArn: agentcoreStack.metadataQueryRuntimeArn,
-  suggestionsRuntimeArn: agentcoreStack.suggestionsRuntimeArn,
+  // AgentCore Runtime ARNs (VKG only)
+  ontologyRuntimeArn: agentcoreStack.ontologyRuntimeArn,
+  queryRuntimeArn: agentcoreStack.queryRuntimeArn,
   // AgentCore Gateway configuration for Neptune access (IAM authenticated)
   neptuneGatewayUrl: agentcoreStack.neptuneGateway?.gatewayUrl,
   neptuneGatewayArn: agentcoreStack.neptuneGateway?.gatewayArn,
@@ -290,30 +234,19 @@ const frontendStack = new FrontendStack(app, `${deployName}-frontend`, {
   cloudFrontHeaderSecret: lambdaApiStack.cloudFrontHeaderSecret,
   distribution: cloudfrontStorageStack.distribution,
   websiteBucket: cloudfrontStorageStack.websiteBucket,
-  enableOntologyAgents,
 });
 
 // Stack dependencies
-if (streamProcessorStack) {
-  streamProcessorStack.addDependency(dynamodbStack);
-  streamProcessorStack.addDependency(dataLakeStack);
-}
-if (zeroEtlStack) {
-  zeroEtlStack.addDependency(dynamodbStack);
-  zeroEtlStack.addDependency(dataLakeStack);
-}
-if (normalizedViewsStack) {
-  normalizedViewsStack.addDependency(zeroEtlStack!);
-  normalizedViewsStack.addDependency(dataLakeStack);
-}
+zeroEtlStack.addDependency(dynamodbStack);
+zeroEtlStack.addDependency(dataLakeStack);
+normalizedViewsStack.addDependency(zeroEtlStack);
+normalizedViewsStack.addDependency(dataLakeStack);
 glueCatalogStack.addDependency(dynamodbStack);
 // Note: GlueCatalogStack creates the Iceberg database first
 // dataLakeStack depends on it (uses the database name)
 dataLakeStack.addDependency(glueCatalogStack);
-if (neptuneStack) {
-  neptuneStack.addDependency(networkingStack);
-  agentcoreStack.addDependency(neptuneStack);
-}
+neptuneStack.addDependency(networkingStack);
+agentcoreStack.addDependency(neptuneStack);
 bedrockKbStack.addDependency(dataLakeStack);
 agentcoreStack.addDependency(bedrockKbStack);
 athenaStack.addDependency(dataLakeStack);
@@ -371,23 +304,19 @@ const suppressions = [
   dynamodbStack,
   glueCatalogStack,
   dataLakeStack,
-  ...(streamProcessorStack ? [streamProcessorStack] : []),
-  ...(zeroEtlStack ? [zeroEtlStack] : []),
-  ...(normalizedViewsStack ? [normalizedViewsStack] : []),
-  ...(neptuneStack ? [neptuneStack] : []),
+  zeroEtlStack,
+  normalizedViewsStack,
+  neptuneStack,
   bedrockKbStack,
   athenaStack,
   agentcoreStack,
-  agentcoreEvalStack,
   cloudfrontStorageStack,
   authStack,
   guardrailsStack,
   lambdaApiStack,
   frontendStack,
 ].forEach((stack) => {
-  if (stack) {
-    NagSuppressions.addStackSuppressions(stack, suppressions);
-  }
+  NagSuppressions.addStackSuppressions(stack, suppressions);
 });
 
 app.synth();

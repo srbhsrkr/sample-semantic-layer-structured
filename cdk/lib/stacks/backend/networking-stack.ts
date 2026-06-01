@@ -1,7 +1,6 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as logs from 'aws-cdk-lib/aws-logs';
-import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 
 export interface NetworkingStackProps extends cdk.StackProps {
@@ -20,12 +19,20 @@ export class NetworkingStack extends cdk.Stack {
     super(scope, id, props);
 
     // Create VPC with public and private subnets.
-    // Explicitly pin to us-east-1b + us-east-1c (AZ IDs use1-az1 + use1-az2):
-    // us-east-1a maps to use1-az6 which is NOT supported by Bedrock AgentCore Runtime.
-    // Supported AZ IDs in us-east-1: use1-az4, use1-az1, use1-az2.
+    //
+    // IMPORTANT: AgentCore Runtime supports only specific AZ IDs in us-east-1
+    // (use1-az1, use1-az2, use1-az4; use1-az6 is NOT supported). AZ IDs are
+    // stable across accounts, but AZ names (us-east-1a, us-east-1b, ...) map to
+    // different AZ IDs in every account, so you MUST look up your own account's
+    // mapping and update the availabilityZones list below accordingly:
+    //   aws ec2 describe-availability-zones \
+    //     --query 'AvailabilityZones[].[ZoneId,ZoneName]' --output table
+    //
+    // Pick the two AZ names that, in your account, correspond to supported AZ
+    // IDs (e.g. use1-az1 and use1-az2) and set them below.
     this.vpc = new ec2.Vpc(this, 'SemanticLayerVPC', {
       vpcName: `${props.projectName}-vpc`,
-      availabilityZones: ['us-east-1b', 'us-east-1c'],
+      availabilityZones: ['us-east-1a', 'us-east-1c'],
       natGateways: 1,
       ipAddresses: ec2.IpAddresses.cidr('10.0.0.0/16'),
       subnetConfiguration: [
@@ -99,6 +106,18 @@ export class NetworkingStack extends cdk.Stack {
     // and invocation traffic to stay within the VPC
     this.vpc.addInterfaceEndpoint('BedrockAgentCoreEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.BEDROCK_AGENTCORE,
+    });
+
+    // AgentCore Gateway endpoint — agents in VPC mode call MCP gateways at
+    // *.gateway.bedrock-agentcore.us-east-1.amazonaws.com which only resolve
+    // through this private service. Without it, ontology agent persist calls
+    // to the Neptune Gateway fail with DNS errors and Neptune stays empty.
+    this.vpc.addInterfaceEndpoint('BedrockAgentCoreGatewayEndpoint', {
+      service: new ec2.InterfaceVpcEndpointService(
+        `com.amazonaws.${cdk.Stack.of(this).region}.bedrock-agentcore.gateway`,
+        443,
+      ),
+      privateDnsEnabled: true,
     });
 
     // Bedrock Agent / Agent Runtime — used by KB ingestion and retrieval tools

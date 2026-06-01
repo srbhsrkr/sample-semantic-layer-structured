@@ -7,7 +7,7 @@ Focus: verify both functions route ALL catalog types (including
 s3tablescatalog/...) through Athena — no Glue fallback, no early-return.
 
 Run locally:
-    cd /Users/huthmac/Documents/AWS/00_workspace/semantic-layer
+    cd <repo-root>
     pytest tests/unit/test_ontology_athena_tools.py -v
 """
 import inspect
@@ -283,17 +283,21 @@ class TestSampleTableData:
         athena.start_query_execution.assert_called_once()
         assert result["success"] is True
 
-    def test_s3tables_query_context_includes_catalog(self, monkeypatch):
+    def test_s3tables_query_context_uses_awsdatacatalog(self, monkeypatch):
+        # Athena does not know the federated catalog as a top-level data source —
+        # it must be addressed via three-part naming under AwsDataCatalog.
         _, athena = self._run(S3_CATALOG, monkeypatch)
         call_kwargs = athena.start_query_execution.call_args[1]
         ctx = call_kwargs["QueryExecutionContext"]
-        assert ctx["Catalog"] == S3_CATALOG
-        assert ctx["Database"] == DB
+        assert ctx["Catalog"] == "AwsDataCatalog"
+        assert "Database" not in ctx
 
-    def test_s3tables_query_is_select_limit(self, monkeypatch):
+    def test_s3tables_query_is_three_part_select_limit(self, monkeypatch):
         _, athena = self._run(S3_CATALOG, monkeypatch, sample_size=5)
         call_kwargs = athena.start_query_execution.call_args[1]
-        assert call_kwargs["QueryString"] == f'SELECT * FROM "{DB}"."{TABLE}" LIMIT 5'
+        assert call_kwargs["QueryString"] == (
+            f'SELECT * FROM "{S3_CATALOG}"."{DB}"."{TABLE}" LIMIT 5'
+        )
 
     def test_s3tables_sample_size_capped_at_50(self, monkeypatch):
         _, athena = self._run(S3_CATALOG, monkeypatch, sample_size=200)

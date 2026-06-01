@@ -13,9 +13,6 @@ import { ArmBuildConstruct } from '../../common/constructs/arm-build-construct';
 export interface DataLakeStackProps extends cdk.StackProps {
   projectName: string;
   glueCatalogStack: GlueCatalogStack;
-  /** When false, skip creating the semantic_layer_iceberg namespace and empty Iceberg tables.
-   *  Used when enableBatchReplication=true (Zero-ETL) manages its own namespaces. */
-  enableRealtimeReplication: boolean;
 }
 
 /**
@@ -189,37 +186,17 @@ export class DataLakeStack extends cdk.Stack {
       onEventHandler: s3TablesManagerFn,
     });
 
-    // Namespace name — always computed for reference, but only created when realtime CDC is on.
+    // Namespace name — kept as a stable identifier; not seeded with tables in Zero-ETL mode.
     const glueNamespace = `${props.projectName}_iceberg`.replace(/-/g, '_');
-
-    // Table names for the realtime CDC pipeline (DynamoDB Streams → PyIceberg).
-    // When enableRealtimeReplication=false (Zero-ETL mode) these are NOT created so
-    // the Zero-ETL UUID namespaces are the sole source of truth in the table bucket.
-    const tableNames = props.enableRealtimeReplication
-      ? [
-          'holding',
-          'party',
-          'coverage',
-          'financialactivity',
-          'financialstatement',
-          'relation',
-          'policyproduct',
-          'coverageproduct',
-          'investproduct',
-          'rider',
-          'admincode',
-          'typecode',
-        ]
-      : [];
 
     const tableBucket = new cdk.CustomResource(this, 'TableBucket', {
       serviceToken: s3TablesProvider.serviceToken,
       properties: {
         Action: 'CreateTableBucket',
         TableBucketName: `${props.projectName}-analytics-tables`,
-        // Pass empty string when realtime replication is off — Lambda skips namespace creation.
-        Namespace: props.enableRealtimeReplication ? glueNamespace : '',
-        Tables: tableNames,
+        // Zero-ETL UUID namespaces are the source of truth — no pre-seeded namespace/tables.
+        Namespace: '',
+        Tables: [],
         Region: this.region,
         Version: '7.0',
       },

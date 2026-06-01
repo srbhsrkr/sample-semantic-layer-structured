@@ -7,6 +7,7 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { ArmBuildConstruct } from '../../../common/constructs/arm-build-construct';
@@ -79,6 +80,20 @@ export class AgentCoreNeptuneGateway extends Construct {
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole'),
       ],
     });
+
+    // AWSLambdaVPCAccessExecutionRole is the AWS-blessed minimum required for Lambda
+    // VPC ENI lifecycle management. Replacing it with a customer-managed inline copy
+    // adds maintenance burden with no security improvement.
+    NagSuppressions.addResourceSuppressions(lambdaRole, [
+      {
+        id: 'AwsSolutions-IAM4',
+        reason:
+          'AWSLambdaVPCAccessExecutionRole is the AWS-recommended minimum policy for Lambda VPC access. It grants only ec2:CreateNetworkInterface / ec2:DescribeNetworkInterfaces / ec2:DeleteNetworkInterface — duplicating it inline gives no security benefit.',
+        appliesTo: [
+          'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole',
+        ],
+      },
+    ]);
 
     // Grant Neptune access
     lambdaRole.addToPolicy(

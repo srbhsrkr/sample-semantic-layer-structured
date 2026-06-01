@@ -86,6 +86,62 @@ def test_get_ontology_content_raises_when_no_path():
         svc.get_metadata_content('x', 'v1')
 
 
+def test_reap_if_stale_marks_processing_as_failed_after_threshold():
+    """Build rows stuck in 'processing' past the staleness threshold flip to 'failed'."""
+    from unittest.mock import MagicMock
+    from datetime import datetime, timedelta, timezone
+    from services.ontology_service import OntologyService
+
+    svc = OntologyService.__new__(OntologyService)
+    svc.table = MagicMock()
+
+    stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    config = {
+        'id': 'abc', 'version': 'v1',
+        'status': 'processing', 'updatedAt': stale,
+    }
+    out = svc._reap_if_stale(config)
+    assert out['status'] == 'failed'
+    assert 'timed out' in out['error'].lower()
+    svc.table.update_item.assert_called_once()
+
+
+def test_reap_if_stale_leaves_recent_processing_row_untouched():
+    """A row that updated recently must not be reaped — agent is still working."""
+    from unittest.mock import MagicMock
+    from datetime import datetime, timezone
+    from services.ontology_service import OntologyService
+
+    svc = OntologyService.__new__(OntologyService)
+    svc.table = MagicMock()
+
+    fresh = datetime.now(timezone.utc).isoformat()
+    config = {
+        'id': 'abc', 'version': 'v1',
+        'status': 'processing', 'updatedAt': fresh,
+    }
+    out = svc._reap_if_stale(config)
+    assert out['status'] == 'processing'
+    svc.table.update_item.assert_not_called()
+
+
+def test_reap_if_stale_ignores_terminal_states():
+    """Completed/failed rows are never re-marked, regardless of age."""
+    from unittest.mock import MagicMock
+    from services.ontology_service import OntologyService
+
+    svc = OntologyService.__new__(OntologyService)
+    svc.table = MagicMock()
+
+    config = {
+        'id': 'abc', 'version': 'v1',
+        'status': 'completed', 'updatedAt': '2020-01-01T00:00:00+00:00',
+    }
+    out = svc._reap_if_stale(config)
+    assert out['status'] == 'completed'
+    svc.table.update_item.assert_not_called()
+
+
 def test_start_revision_stores_context_and_triggers_agent():
     """Test start_revision_async stores context in v1 and triggers agent"""
     from unittest.mock import MagicMock

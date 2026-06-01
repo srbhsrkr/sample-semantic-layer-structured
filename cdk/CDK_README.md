@@ -75,7 +75,7 @@ cdk deploy --all --require-approval never
 
 This will:
 1. ✅ Create VPC and networking
-2. ✅ Create DynamoDB tables with synthetic data
+2. ✅ Create DynamoDB tables (empty — load your own data)
 3. ✅ Create S3 data lake buckets (historical data, artifacts, logging)
 4. ✅ Create Glue databases and crawlers
 5. ✅ **Auto-start Glue crawlers** to discover schemas
@@ -440,20 +440,20 @@ aws cognito-idp admin-add-user-to-group \
 
 The deployment is largely automated. Here are the optional verification steps:
 
-### 1. Verify Synthetic Data (Auto-Loaded)
+### 1. Load Your Data into DynamoDB
 
-Synthetic insurance data is automatically loaded during DynamoDB stack deployment (when `loadSyntheticData: true`):
+The DynamoDB tables are created empty. Load your own operational data into them
+using the `pk`/`sk` composite-key schema (one table per insurance entity, e.g.
+`semantic-layer-parties`, `semantic-layer-holdings`). Verify with:
 
 ```bash
-# Verify data was loaded
-aws dynamodb scan \
-  --table-name semantic-layer-insurance-data \
-  --select COUNT
+# List the created tables
+aws dynamodb list-tables
 
-# Check specific items
-aws dynamodb get-item \
-  --table-name semantic-layer-insurance-data \
-  --key '{"pk":{"S":"PARTY#P001"},"sk":{"S":"PARTY#P001"}}'
+# Verify row counts after loading
+aws dynamodb scan \
+  --table-name semantic-layer-parties \
+  --select COUNT
 ```
 
 ### 2. Monitor Glue Crawlers (Auto-Started)

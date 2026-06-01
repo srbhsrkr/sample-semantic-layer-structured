@@ -24,6 +24,9 @@ export default function DescribeIntent({ user }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
+  // Stable client-generated id reused across retries / double-submits / token-refresh
+  // re-tries, so POST /ontology/config is idempotent for this form session.
+  const [draftId] = useState(() => id || (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2)));
 
   useEffect(() => {
     if (id) {
@@ -50,16 +53,13 @@ export default function DescribeIntent({ user }) {
       const normalizedName = name.toLowerCase().replace(/\s+/g, '');
 
       const data = {
+        id: draftId,
         name: normalizedName,
         dataSourcesDescription,
         useCasesDescription,
         createdBy: user?.email || user?.username,
         status: 'draft',
       };
-
-      if (id) {
-        data.id = id;
-      }
 
       const result = await ontologyAPI.createOntologyConfig(data);
 
@@ -109,8 +109,8 @@ export default function DescribeIntent({ user }) {
       <Container>
         <SpaceBetween size="l">
           <FormField
-            label="Semantic metadata name"
-            description="A unique name for this semantic metadata (will be normalized to lowercase with no spaces for namespace)"
+            label="Semantic knowledge base name"
+            description="A unique name for this semantic knowledge base (will be normalized to lowercase with no spaces for namespace)"
             constraintText="Name will be converted to lowercase and spaces removed"
           >
             <Input
@@ -174,7 +174,7 @@ export default function DescribeIntent({ user }) {
         </Box>
         <ul>
           <li>Understand the domain and context of your data</li>
-          <li>Generate appropriate semantic metadata patterns and relationships</li>
+          <li>Generate appropriate semantic patterns and relationships</li>
           <li>Provide better natural language understanding</li>
         </ul>
       </Container>

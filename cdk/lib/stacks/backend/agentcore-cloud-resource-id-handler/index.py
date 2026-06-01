@@ -45,11 +45,12 @@ def on_event(event, context):  # noqa: ARG001
 
     logger.info("RequestType=%s runtimeId=%s", request_type, runtime_id)
 
-    physical_id = f"cloud-resource-id-{runtime_id}"
-
     if request_type == "Delete":
-        # Nothing to undo — leave env vars in place.
-        return {"PhysicalResourceId": physical_id}
+        # Echo back the PhysicalResourceId CFN already has — changing it during
+        # delete causes a "cannot change physical resource id" rollback failure.
+        return {"PhysicalResourceId": event.get("PhysicalResourceId", f"cloud-resource-id-{runtime_id}")}
+
+    physical_id = f"cloud-resource-id-{runtime_id}"
 
     logs_client = boto3.client("logs", region_name=region)
     client = boto3.client("bedrock-agentcore-control", region_name=region)
@@ -101,13 +102,31 @@ def on_event(event, context):  # noqa: ARG001
     except logs_client.exceptions.ResourceAlreadyExistsException:
         logger.info("Log stream 'runtime-logs' already exists in %s", eval_log_group)
 
-    resp = client.update_agent_runtime(
-        agentRuntimeId=runtime_id,
-        environmentVariables=env,
-        roleArn=r["roleArn"],
-        agentRuntimeArtifact=r["agentRuntimeArtifact"],
-        networkConfiguration=r["networkConfiguration"],
-    )
-    logger.info("update_agent_runtime status: %s", resp.get("status"))
+    # Bedrock (post-2026-05-19) rejects any UpdateAgentRuntime call that re-submits
+    # `networkConfiguration` — even when the value is unchanged or strips
+    # `requireServiceS3Endpoint`. The OTEL injection here is observability-only
+    # (cloud.resource_id + log-group routing for the eval SDK), so on a
+    # ValidationException we log a warning and succeed the custom resource so
+    # stack creation proceeds.
+    network_config = {
+        k: v for k, v in r["networkConfiguration"].items()
+        if k != "requireServiceS3Endpoint"
+    }
+
+    try:
+        resp = client.update_agent_runtime(
+            agentRuntimeId=runtime_id,
+            environmentVariables=env,
+            roleArn=r["roleArn"],
+            agentRuntimeArtifact=r["agentRuntimeArtifact"],
+            networkConfiguration=network_config,
+        )
+        logger.info("update_agent_runtime status: %s", resp.get("status"))
+    except client.exceptions.ValidationException as e:
+        logger.warning(
+            "Skipping OTEL env injection for %s — AgentCore rejected UpdateAgentRuntime: %s. "
+            "Tracing/log-correlation will use defaults. This is observability-only and does not affect agent function.",
+            runtime_id, e,
+        )
 
     return {"PhysicalResourceId": physical_id}

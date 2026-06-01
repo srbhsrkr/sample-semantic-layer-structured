@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Container,
   Header,
@@ -13,11 +13,10 @@ import {
   ExpandableSection,
   Table,
   Tabs,
-  Grid,
-  Link,
+  Toggle,
 } from '@cloudscape-design/components';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { queryAPI, ontologyAPI, submitMetadataQuery, pollMetadataQuery } from '../../services/api';
+import { queryAPI, ontologyAPI } from '../../services/api';
 import ReactMarkdown from 'react-markdown';
 
 export default function NaturalLanguageQuery({ user, addNotification }) {
@@ -34,19 +33,33 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
   const [error, setError] = useState(null);
   const [clarification, setClarification] = useState(null);
   // clarification shape: { question: string, options: [{id, label}] }
-  const [suggestedQuestions, setSuggestedQuestions] = useState([]);
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
-  const loadRequestRef = useRef(0);
+  const [currentStep, setCurrentStep] = useState('');
+  // Advanced toggle: ON (default) → supervisor (judge-driven retry loop);
+  //                  OFF          → single_shot (one-pass agent call).
+  const [advancedMode, setAdvancedMode] = useState(true);
 
   useEffect(() => {
     loadOntologies();
   }, []);
 
-  useEffect(() => {
-    if (selectedOntology?.value) {
-      loadSuggestedQuestions(selectedOntology.value);
-    }
-  }, [selectedOntology?.value]);
+  // Map raw step keys (written by the lambda worker + agent) to user-friendly
+  // labels. Keep this list in sync with the producers in
+  // lambda/rest-api/services/query_service.py and
+  // agents/ontology_query_agent/main.py.
+  const STEP_LABELS = {
+    validating_input: 'Validating your question…',
+    invoking_agent: 'Invoking the query agent…',
+    invoking_agent_supervisor: 'Invoking the query agent (supervisor)…',
+    invoking_agent_single_shot: 'Invoking the query agent (single shot)…',
+    fetching_ontology: 'Loading the knowledge graph…',
+    querying_neptune: 'Exploring the knowledge graph…',
+    disambiguating_terms: 'Resolving terms against the ontology…',
+    generating_sql: 'Generating SQL…',
+    running_athena: 'Running Athena query…',
+    mapping_to_rdf: 'Mapping results to RDF…',
+    summarizing: 'Summarizing the answer…',
+    processing_response: 'Finalizing the response…',
+  };
 
   const markdownHeadingComponents = {
     h1: ({ children }) => <strong style={{ fontSize: '0.85rem' }}>{children}</strong>,
@@ -88,48 +101,10 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
     }
   };
 
-  const loadSuggestedQuestions = async (ontologyId) => {
-    if (!ontologyId) {
-      setSuggestedQuestions([]);
-      return;
-    }
-    const requestId = ++loadRequestRef.current;
-    setLoadingSuggestions(true);
-    try {
-      const result = await queryAPI.getSuggestedQuestions(ontologyId);
-      if (requestId !== loadRequestRef.current) return; // stale response — newer request in flight
-      if (result.success && Array.isArray(result.data?.suggestions)) {
-        setSuggestedQuestions(result.data.suggestions);
-      } else {
-        setSuggestedQuestions([]);
-      }
-    } catch (_err) {
-      if (requestId !== loadRequestRef.current) return;
-      console.error('Failed to load query suggestions:', _err);
-      setSuggestedQuestions([]);
-    } finally {
-      if (requestId === loadRequestRef.current) {
-        setLoadingSuggestions(false);
-      }
-    }
-  };
-
-  // Normalize the metadata_service result shape to match the display components.
-  // Backend returns { answer, sql_query, results[{}], n_quads[], reasoning{} }
-  const normalizeMetadataQueryResult = (data) => {
-    return {
-      answer: data.answer || '',
-      sql_query: data.sql_query || '',
-      results: data.results || [],
-      n_quads: data.n_quads || [],
-      reasoning: data.reasoning || {},
-    };
-  };
-
   const handleSubmit = async (overrideQuestion = null) => {
     const currentQuestion = overrideQuestion || question;
     if (!currentQuestion.trim() || !selectedOntology) {
-      setError('Please enter a question and select a semantic metadata layer');
+      setError('Please enter a question and select a semantic knowledge base');
       return;
     }
 
@@ -137,114 +112,70 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
     setSubmitting(true);
     setQueryResult(null);
     setActiveTab('answer');
+    setCurrentStep('validating_input');
 
     try {
-      if (selectedOntology?.type === 'SemanticRAG') {
-        // SemanticRAG path — render results inline (same as VKG path)
-        try {
-          const submitResult = await submitMetadataQuery(
-            currentQuestion,
-            selectedOntology.value
-          );
+      const result = await queryAPI.submitQuery(
+        currentQuestion,
+        selectedOntology.value,
+        advancedMode ? 'supervisor' : 'single_shot'
+      );
 
-          if (!submitResult.success) {
-            setError(submitResult.error || 'Failed to submit metadata query');
-            setSubmitting(false);
-            return;
+      if (result.success) {
+        const queryId = result.data.queryId;
+        const notificationId = `query-${queryId}`;
+
+        addNotification?.({
+          type: 'info',
+          content: 'Query submitted. Processing...',
+          dismissible: true,
+          id: notificationId,
+        });
+
+        const finalResult = await queryAPI.pollQueryUntilComplete(queryId, {
+          onStatus: (s) => {
+            if (s?.current_step) setCurrentStep(s.current_step);
+          },
+        });
+
+        if (finalResult.success) {
+          const data = finalResult.data;
+          if (data.needs_clarification) {
+            setClarification({
+              question: data.clarification_question,
+              options: data.options || [],
+            });
+          } else {
+            setQueryResult(data);
+            setClarification(null);
           }
 
-          const { queryId } = submitResult.data;
-          const notificationId = `query-${queryId}`;
-
           addNotification?.({
-            type: 'info',
-            content: 'Query submitted. Processing...',
+            type: 'success',
+            content: 'Query completed successfully!',
             dismissible: true,
             id: notificationId,
           });
-
-          const result = await pollMetadataQuery(queryId);
-
-          if (result.success) {
-            addNotification?.({
-              type: 'success',
-              content: 'Query completed successfully!',
-              dismissible: true,
-              id: notificationId,
-            });
-            setQueryResult(normalizeMetadataQueryResult(result.data));
-            setClarification(null);
-          } else {
-            setError(result.error || 'Query failed');
-            addNotification?.({
-              type: 'error',
-              content: `Query failed: ${result.error || 'Unknown error'}`,
-              dismissible: true,
-              id: notificationId,
-            });
-          }
-        } catch (err) {
-          setError(err.message || 'An error occurred processing metadata query');
+        } else {
+          const isBlocked = finalResult.status === 'BLOCKED';
+          const headline = isBlocked ? 'Query blocked by content policy' : 'Query failed';
+          const detail = finalResult.error || 'Unknown error';
+          setError(`${headline}: ${detail}`);
+          addNotification?.({
+            type: isBlocked ? 'warning' : 'error',
+            content: `${headline}: ${detail}`,
+            dismissible: true,
+            id: notificationId,
+          });
         }
       } else {
-        // Existing VKG path
-        const result = await queryAPI.submitQuery(
-          currentQuestion,
-          selectedOntology.value
-        );
-
-        if (result.success) {
-          const queryId = result.data.queryId;
-          // Use a stable notification ID so subsequent updates replace this banner
-          // instead of stacking a new one on top of the "Processing…" banner.
-          const notificationId = `query-${queryId}`;
-
-          addNotification?.({
-            type: 'info',
-            content: 'Query submitted. Processing...',
-            dismissible: true,
-            id: notificationId,
-          });
-
-          const finalResult = await queryAPI.pollQueryUntilComplete(queryId);
-
-          if (finalResult.success) {
-            const data = finalResult.data;
-            if (data.needs_clarification) {
-              setClarification({
-                question: data.clarification_question,
-                options: data.options || [],
-              });
-            } else {
-              setQueryResult(data);
-              setClarification(null);
-            }
-
-            // Same ID → replaces the "Processing…" banner
-            addNotification?.({
-              type: 'success',
-              content: 'Query completed successfully!',
-              dismissible: true,
-              id: notificationId,
-            });
-          } else {
-            setError(finalResult.error || 'Query failed');
-            // Same ID → replaces the "Processing…" banner
-            addNotification?.({
-              type: 'error',
-              content: `Query failed: ${finalResult.error || 'Unknown error'}`,
-              dismissible: true,
-              id: notificationId,
-            });
-          }
-        } else {
-          setError(result.error || 'Failed to submit query');
-        }
+        setError(result.error || 'Failed to submit query');
       }
     } catch (err) {
       setError(err.message || 'An error occurred');
     } finally {
       setSubmitting(false);
+      setCurrentStep('');
     }
   };
 
@@ -363,54 +294,6 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
       ]
     : [];
 
-  const suggestedQuestionsSidebar = (
-    <Container
-      header={
-        <Header
-          variant="h2"
-          description={
-            loadingSuggestions
-              ? 'Loading suggestions for this layer...'
-              : "Click 'Try this' to populate the question field"
-          }
-        >
-          Suggested Questions
-        </Header>
-      }
-    >
-      {loadingSuggestions ? (
-        <Box textAlign="center" padding="m">
-          <StatusIndicator type="loading">
-            Generating suggestions...
-          </StatusIndicator>
-        </Box>
-      ) : suggestedQuestions.length === 0 ? (
-        <Box color="text-status-inactive" padding="m">
-          Select a semantic metadata layer to see suggested questions.
-        </Box>
-      ) : (
-        <SpaceBetween size="m">
-          {suggestedQuestions.map((item, index) => (
-            <Box key={index}>
-              <SpaceBetween size="xxs">
-                <Box variant="small" color="text-status-inactive">
-                  {item.category}
-                </Box>
-                <Box variant="p">{item.question}</Box>
-                <Link
-                  onFollow={() => setQuestion(item.question)}
-                  variant="secondary"
-                >
-                  Try this
-                </Link>
-              </SpaceBetween>
-            </Box>
-          ))}
-        </SpaceBetween>
-      )}
-    </Container>
-  );
-
   return (
     <SpaceBetween size="l">
       <Header
@@ -426,24 +309,18 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
         </Alert>
       )}
 
-      <Grid
-        gridDefinition={[
-          { colspan: { default: 12, s: 8 } },
-          { colspan: { default: 12, s: 4 } },
-        ]}
-      >
-        <SpaceBetween size="l">
+      <SpaceBetween size="l">
           <Container>
             <SpaceBetween size="l">
               <FormField
-                label="Select Semantic Metadata Layer"
-                description="Choose which semantic metadata to query against"
+                label="Select Semantic Knowledge Base"
+                description="Choose which semantic knowledge base to query against"
               >
                 <Select
                   selectedOption={selectedOntology}
                   onChange={({ detail }) => setSelectedOntology(detail.selectedOption)}
                   options={ontologies}
-                  placeholder="Select a semantic metadata layer"
+                  placeholder="Select a semantic knowledge base"
                   disabled={ontologies.length === 0}
                   empty="No ontologies available"
                 />
@@ -460,6 +337,23 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
                   rows={4}
                   disabled={submitting}
                 />
+              </FormField>
+
+              <FormField
+                label="Advanced (supervisor loop)"
+                description={
+                  advancedMode
+                    ? 'Supervisor judges each answer and retries with hints when it falls short. Slower but more accurate on multi-hop questions.'
+                    : 'Single-shot — one agent call, no judge or retry. Faster, but errors are not corrected.'
+                }
+              >
+                <Toggle
+                  checked={advancedMode}
+                  onChange={({ detail }) => setAdvancedMode(detail.checked)}
+                  disabled={submitting}
+                >
+                  {advancedMode ? 'Supervisor' : 'Single shot'}
+                </Toggle>
               </FormField>
 
               <Box>
@@ -503,7 +397,7 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
             <Container>
               <Box textAlign="center" padding="l">
                 <StatusIndicator type="loading">
-                  Processing your query. This may take a few moments...
+                  {STEP_LABELS[currentStep] || 'Processing your query. This may take a few moments…'}
                 </StatusIndicator>
               </Box>
             </Container>
@@ -607,7 +501,7 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
           {ontologies.length === 0 && (
             <Container>
               <Alert type="warning">
-                No semantic metadata layers available. Please complete the admin setup process first.
+                No semantic knowledge bases available. Please complete the admin setup process first.
               </Alert>
               <Box margin={{ top: 'm' }}>
                 <Button onClick={() => navigate('/admin')}>
@@ -616,10 +510,7 @@ export default function NaturalLanguageQuery({ user, addNotification }) {
               </Box>
             </Container>
           )}
-        </SpaceBetween>
-
-        {suggestedQuestionsSidebar}
-      </Grid>
+      </SpaceBetween>
     </SpaceBetween>
   );
 }

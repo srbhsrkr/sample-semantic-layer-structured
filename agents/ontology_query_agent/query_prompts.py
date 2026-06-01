@@ -13,6 +13,16 @@ Use `<id>` as the input to `get_ontology_from_neptune`.
 If the header also includes `[catalog: <cat_id>]`, use `<cat_id>` as the `catalog_id`
 argument to `execute_sql_query` — it overrides the value from Neptune's `databases` list.
 
+If the header contains `[ontology_cached: true]`, the ontology JSON is already
+provided inline between `[ontology_payload]` and `[/ontology_payload]` markers.
+**SKIP step 1 (get_ontology_from_neptune) entirely** — pass the inline JSON
+directly as `ontology_info` to `disambiguate_query_terms` and continue from step 2.
+
+The header may also contain `[supervisor_hint: <text>]` — this is feedback from a
+previous attempt at the same question. Treat it as authoritative guidance: if the
+hint says "previous attempt returned 0 rows for this date filter", widen the filter.
+If it says "wrong catalog", use the suggested one. Do NOT ignore the hint.
+
 ## Tools (call in this EXACT order)
 
 1. **get_ontology_from_neptune(ontology_id)**

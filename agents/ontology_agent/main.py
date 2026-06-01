@@ -519,12 +519,23 @@ def sample_table_data(
                 f"Glue lookup failed for {database_name}.{table_name}: {glue_err}"
             )
 
-    query = f'SELECT * FROM "{effective_database}"."{effective_table}" LIMIT {sample_size}'  # nosec B608 - table/database names sourced from Glue catalog (trusted AWS service, not user input)
-
-    # Use the effective catalog for query routing
-    query_context: Dict[str, str] = {"Database": effective_database}
-    if effective_catalog and effective_catalog not in ("AWSDataCatalog", "AwsDataCatalog"):
-        query_context["Catalog"] = effective_catalog
+    # S3 Tables federated catalog: Athena cannot resolve "s3tablescatalog/<bucket>" via
+    # QueryExecutionContext.Catalog — it is a Glue federated catalog, not an Athena data
+    # catalog. Use a three-part name in the FROM clause and run under AwsDataCatalog.
+    is_s3tables = bool(
+        effective_catalog and effective_catalog.startswith("s3tablescatalog/")
+    )
+    if is_s3tables:
+        query = (
+            f'SELECT * FROM "{effective_catalog}"."{effective_database}".'
+            f'"{effective_table}" LIMIT {sample_size}'  # nosec B608
+        )
+        query_context: Dict[str, str] = {"Catalog": "AwsDataCatalog"}
+    else:
+        query = f'SELECT * FROM "{effective_database}"."{effective_table}" LIMIT {sample_size}'  # nosec B608 - table/database names sourced from Glue catalog (trusted AWS service, not user input)
+        query_context = {"Database": effective_database}
+        if effective_catalog and effective_catalog not in ("AWSDataCatalog", "AwsDataCatalog"):
+            query_context["Catalog"] = effective_catalog
 
     try:
         response = athena.start_query_execution(
@@ -874,22 +885,33 @@ def update_progress(
 
         # Update DynamoDB with progress
         active_version = _resolve_active_version(table, ontology_id)
-        table.update_item(
-            Key={
-                "id": ontology_id,
-                "version": active_version,
-            },
-            UpdateExpression="SET #status = :status, tablesProcessed = :processed, totalTables = :total, currentTable = :current, progressPercent = :percent, updatedAt = :updated",
-            ExpressionAttributeNames={"#status": "status"},
-            ExpressionAttributeValues={
-                ":status": "processing",
-                ":processed": tables_processed,
-                ":total": total_tables,
-                ":current": current_table,
-                ":percent": progress_percent,
-                ":updated": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        # ConditionExpression: do not resurrect a row deleted by the user mid-build.
+        # update_item is upsert by default, which previously created zombie rows
+        # with name=None for ontology_ids the user had already deleted.
+        try:
+            table.update_item(
+                Key={
+                    "id": ontology_id,
+                    "version": active_version,
+                },
+                UpdateExpression="SET #status = :status, tablesProcessed = :processed, totalTables = :total, currentTable = :current, progressPercent = :percent, updatedAt = :updated",
+                ConditionExpression="attribute_exists(id)",
+                ExpressionAttributeNames={"#status": "status"},
+                ExpressionAttributeValues={
+                    ":status": "processing",
+                    ":processed": tables_processed,
+                    ":total": total_tables,
+                    ":current": current_table,
+                    ":percent": progress_percent,
+                    ":updated": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            logger.warning(
+                f"Ontology {ontology_id} no longer exists in DynamoDB — "
+                f"skipping progress update (user deleted mid-build)"
+            )
+            return json.dumps({"status": "skipped", "reason": "ontology_deleted"})
 
         logger.info(
             f"✓ Progress updated: {tables_processed}/{total_tables} tables ({progress_percent}%) - Current: {current_table}"
@@ -1602,6 +1624,39 @@ def persist_file_to_neptune(ontology_id: str, table_name: str) -> str:
     except Exception as e:
         logger.error(f"Error calling Neptune Gateway for {table_name}: {e}")
         return json.dumps({"success": False, "error": str(e)})
+
+
+def _neptune_gateway_reachable() -> tuple[bool, str]:
+    """
+    Synchronous pre-flight check: verify the Neptune Gateway is callable.
+
+    Calls a no-op tool (discover_named_graphs) so a single round-trip confirms
+    DNS, network path, and IAM all work. Returns (ok, error_message).
+    """
+    gateway_url = os.environ.get("NEPTUNE_GATEWAY_URL")
+    if not gateway_url:
+        return False, "NEPTUNE_GATEWAY_URL not configured"
+
+    try:
+        import uuid
+
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        mcp_client = MCPClient(
+            lambda: aws_iam_streamablehttp_client(
+                endpoint=gateway_url,
+                aws_region=region,
+                aws_service="bedrock-agentcore",
+            )
+        )
+        with mcp_client:
+            mcp_client.call_tool_sync(
+                str(uuid.uuid4()),
+                "persist-to-neptune___discover_named_graphs",
+                {},
+            )
+        return True, ""
+    except Exception as e:
+        return False, str(e)
 
 
 @tool
@@ -2749,14 +2804,20 @@ def update_dynamodb_status(ontology_id: str, status: str, version: str = None, *
         expr_attr_names = {f"#{k}": k for k in update_data.keys()}
         expr_attr_values = {f":{k}": v for k, v in update_data.items()}
 
-        table.update_item(
-            Key={"id": ontology_id, "version": version},
-            UpdateExpression=update_expr,
-            ExpressionAttributeNames=expr_attr_names,
-            ExpressionAttributeValues=expr_attr_values,
-        )
-
-        logger.info(f"Updated DynamoDB: {ontology_id} (version={version}) → {status}")
+        try:
+            table.update_item(
+                Key={"id": ontology_id, "version": version},
+                UpdateExpression=update_expr,
+                ConditionExpression="attribute_exists(id)",
+                ExpressionAttributeNames=expr_attr_names,
+                ExpressionAttributeValues=expr_attr_values,
+            )
+            logger.info(f"Updated DynamoDB: {ontology_id} (version={version}) → {status}")
+        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            logger.warning(
+                f"Ontology {ontology_id} no longer exists in DynamoDB — "
+                f"skipping status update to '{status}' (user deleted mid-build)"
+            )
 
     except Exception as e:
         logger.error(f"Failed to update DynamoDB status: {e}")
@@ -2894,6 +2955,26 @@ def invoke(payload, context):
                 logger.info(f"[Phase 1] All {total_tables} tables processed")
 
                 # ── PHASE 2: holistic refinement ───────────────────────────────
+                # Pre-flight: confirm we can reach the Neptune Gateway before
+                # running 45 per-table agents that would each silently fail.
+                # Without this, Phase 2 swallows persist errors and the build
+                # is misleadingly reported "completed" with an empty Neptune.
+                gateway_ok, gateway_err = _neptune_gateway_reachable()
+                if not gateway_ok:
+                    logger.error(
+                        f"[Phase 2] Neptune Gateway unreachable — aborting build: {gateway_err}"
+                    )
+                    update_dynamodb_status(
+                        ontology_id=ontology_id,
+                        status="failed",
+                        error=(
+                            f"Neptune Gateway unreachable from agent runtime: {gateway_err}. "
+                            "Check VPC endpoint for bedrock-agentcore.gateway service."
+                        ),
+                        failedAt=datetime.now(timezone.utc).isoformat(),
+                    )
+                    return
+
                 # Build FK plan in Python — avoids loading all N-Quads into an
                 # agent context just to extract small fk_hints strings.
                 update_dynamodb_status(
