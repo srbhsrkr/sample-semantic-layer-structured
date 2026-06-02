@@ -4,12 +4,12 @@
 
 This project implements a **Virtual Knowledge Graph (VKG)** semantic layer for structured insurance data on AWS. An OWL ontology is generated from your AWS Glue catalog, persisted in Amazon Neptune, and used to translate natural-language questions into SQL executed on Amazon Athena.
 
-This is a customer-facing distribution focused on the VKG path. For the full reference implementation (including Semantic RAG, real-time CDC, and the AgentCore evaluation harness) see the `main` branch.
+This is a customer-facing distribution focused on the VKG path. For the full reference implementation (including Semantic RAG, real-time CDC, and the AgentCore evaluation harness) see the parent repo: https://github.com/aws-samples/sample-semantic-layer-structured.
 
 ### Key Capabilities
 
 - **Virtual Knowledge Graph in Amazon Neptune** — business concepts, relationships, and `mapsToTable` / `mapsToColumn` traceability stored as RDF/OWL
-- **AI-Powered Ontology Generation** — schema sampling + retrieval of design patterns from a Bedrock Knowledge Base produces OWL N-Quads written back to Glue and Iceberg metadata
+- **AI-Powered Ontology Generation** — schema sampling + retrieval of design patterns from a Bedrock Knowledge Base produces OWL N-Quads written back to Neptune, with AI-generated column/table descriptions written back to the Glue Data Catalog (including S3 Tables / Iceberg)
 - **Versioned, iterative semantic layer creation** — pointer + history pattern for human-in-the-loop refinement
 - **Natural Language Queries** — agents translate plain English to SPARQL → SQL → Athena
 - **Federated query** — Athena bridges DynamoDB (operational) and S3 Tables / Apache Iceberg (analytical)
@@ -38,7 +38,7 @@ This is a customer-facing distribution focused on the VKG path. For the full ref
 ┌────────────────────────────────────────────────────────────────┐
 │                    AUTHENTICATION LAYER                        │
 │  Amazon Cognito - User Pool / Identity Pool / OAuth 2.0        │
-│  Groups: Admins, QueryUsers                                    │
+│  Groups: Admin, Users                                          │
 └────────────────────────────────────────────────────────────────┘
                               ↓
 ┌────────────────────────────────────────────────────────────────┐
@@ -145,30 +145,6 @@ This is a customer-facing distribution focused on the VKG path. For the full ref
 - Workflow: Neptune ontology lookup → disambiguation → SPARQL → SQL → Athena
 - Reasoning steps displayed for transparency
 
-## Data Sources
-
-### 1. DynamoDB — Operational Data (12 tables)
-`HOLDING`, `PARTY`, `COVERAGE`, `RIDER`, `RELATION`, `FINANCIALACTIVITY`, `FINANCIALSTATEMENT`, `POLICYPRODUCT`, `COVERAGEPRODUCT`, `INVESTPRODUCT`, `TYPE_CODES`, `ADMIN_CODES`
-
-**Access**: Athena with DynamoDB Connector (`lambda:` catalog) or direct DynamoDB reads.
-
-### 2. S3 Tables (Apache Iceberg) — Analytical Data
-
-```
-DynamoDB table → Glue Zero-ETL → S3 Tables (zetl_<uuid> namespace)
-                                          ↓
-                                Glue 5.1 Materialized Views job
-                                          ↓
-                                S3 Tables (normalized namespace)
-                                └─ 40 entity tables (holding, party,
-                                   coverage, rider, relation, ...)
-```
-
-- Glue Zero-ETL integration per DynamoDB table → S3 Tables (each integration creates a fresh `zetl_<uuid>` namespace)
-- **NormalizedViewsStack**: Glue 5.1 PySpark job creates 40 Iceberg materialized views in a `normalized` namespace, applying `sk LIKE '<Prefix>#%'` filters to demultiplex each flat Zero-ETL table into its constituent entity tables
-- Scheduled refresh every 6 hours via EventBridge; incremental Iceberg refresh where possible
-- `zetl_*` namespaces are internal replication staging — the `normalized` namespace is the user-facing analytical layer
-
 ## AI Agents (Strands Framework)
 
 ### 1. Ontology Generation Agent
@@ -211,11 +187,21 @@ update_glue_metadata_from_ontology(ontology_id, database_name, table_name, catal
 
 **Workflow**: Neptune → disambiguate → generate SQL → Athena → RDF N-QUADS → STOP.
 
+**Execution modes** (selected by the `mode` field on the invocation payload; exposed as the **Advanced** toggle on the query page):
+- **Supervisor loop** (`supervisor`, default) — wraps the agent in a judge-driven retry loop: after each attempt a separate structured-output call decides whether the agent actually answered the question, and if not it retries or decomposes the query into subqueries. Bounded by a conservative retry budget (2 full attempts, 2 replans) so it can't spin.
+- **Single shot** (`single_shot`) — one agent pass with no judge and no retry; mirrors the original pre-supervisor behavior. Faster and cheaper, but no self-correction.
+
 **Dynamic row limits**: default 10, user-specified (e.g. "top 30"), max 100.
 
 ## CDK Infrastructure (TypeScript)
 
 ### Stack Architecture (15 stacks)
+
+> Stack names include a deployment suffix: `semantic-layer-<suffix>-<name>`,
+> where `<suffix>` defaults to `dev` (override with `cdk deploy --context
+> suffix=<x>`). The names below omit the suffix for brevity — the actual
+> deployed names are `semantic-layer-dev-networking`,
+> `semantic-layer-dev-dynamodb`, and so on.
 
 ```
 1.  semantic-layer-networking
@@ -296,7 +282,7 @@ update_glue_metadata_from_ontology(ontology_id, database_name, table_name, catal
 - **Knowledge Base bucket**: Source docs for Bedrock KB
 - **Lake Formation**: Grants for Athena execution role and agent roles
 
-#### Zero-ETL Stack (`zeroetl.ts`)
+#### Zero-ETL Stack (`zeroetl/index.ts`)
 - 12 Glue Zero-ETL integrations — one per DynamoDB source table → S3 Tables
 - Each integration creates a `zetl_<uuid>` namespace in the S3 Tables bucket
 - Multiple deployments create multiple UUID namespaces; the NormalizedViewsStack job dynamically discovers the newest per source table at runtime
@@ -374,7 +360,7 @@ semantic-layer/
 │       │   ├── dynamodb-stack.ts
 │       │   ├── glue-catalog-stack.ts
 │       │   ├── data-lake-stack.ts
-│       │   ├── zeroetl.ts
+│       │   ├── zeroetl/index.ts
 │       │   ├── normalized-views-stack.ts
 │       │   ├── neptune-stack.ts
 │       │   ├── bedrock-kb-stack.ts
@@ -400,19 +386,22 @@ semantic-layer/
 │   └── create-normalized-views.py    # Glue 5.1 PySpark job — 40 Iceberg MVs
 │
 ├── lambda/
-│   └── rest-api/                     # FastAPI application
-│       ├── main.py
-│       ├── ontology_api.py
-│       ├── query_api.py
-│       ├── datasource_api.py
-│       ├── neptune_api.py
-│       └── services/
-│           ├── agentcore_service.py
-│           ├── glue_service.py
-│           ├── guardrail_service.py
-│           ├── neptune_service.py
-│           ├── ontology_service.py
-│           └── query_service.py
+│   ├── rest-api/                     # FastAPI application
+│   │   ├── main.py
+│   │   ├── auth.py
+│   │   ├── ontology_api.py
+│   │   ├── query_api.py
+│   │   ├── datasource_api.py
+│   │   ├── neptune_api.py
+│   │   └── services/
+│   │       ├── agentcore_service.py
+│   │       ├── glue_service.py
+│   │       ├── guardrail_service.py
+│   │       ├── neptune_service.py
+│   │       ├── ontology_service.py
+│   │       └── query_service.py
+│   ├── neptune-tools/                # MCP backend for the AgentCore Neptune Gateway
+│   └── s3tables-manager/             # Custom resource: S3 Tables + Iceberg init
 │
 ├── frontend/                         # React Frontend
 │   └── src/pages/
@@ -489,31 +478,64 @@ cdk deploy --all
 Deployment takes ~35–50 minutes (includes ARM64 CodeBuild for the FastAPI Lambda
 + 2 agent images). See [Deployment](#deployment) for incremental/subset options.
 
-### Step 2 — Load your data
+### Step 2 — Bring your own data
 
-The 12 DynamoDB tables are created **empty** — this build ships no sample data.
-Load your own operational data into them, then let the pipeline replicate and
-normalize it:
+The 13 DynamoDB tables (12 operational + 1 metadata) are created **empty** — this
+build ships no sample data. You have two ways to give the semantic layer
+something to model and query.
 
-1. **Write to DynamoDB** using the `pk`/`sk` composite-key schema, one table per
-   entity (`semantic-layer-parties`, `semantic-layer-holdings`,
-   `semantic-layer-coverages`, …). Use the AWS CLI/SDK or your own ETL.
+#### Option A — Load into the provided DynamoDB tables (recommended)
+
+The deploy creates one table per entity, named `semantic-layer-<suffix>-<entity>`.
+The default suffix is `dev`, so the tables are `semantic-layer-dev-holdings`,
+`semantic-layer-dev-parties`, `semantic-layer-dev-coverages`, etc. (if you
+deployed with `--context suffix=<x>`, substitute it).
+
+1. **Confirm the table names:**
    ```bash
-   aws dynamodb list-tables          # confirm the table names
+   aws dynamodb list-tables --query "TableNames[?contains(@, 'semantic-layer')]"
    ```
-2. **Replication is automatic** — Glue Zero-ETL streams each table into S3 Tables
-   (`zetl_<uuid>`), and the NormalizedViews Glue job builds the 40 Iceberg
+2. **Write items** using the `pk`/`sk` composite-key schema — `pk` is the entity
+   key, `sk` is a record discriminator, and the remaining attributes are your
+   domain fields. For example, a party record:
+   ```bash
+   aws dynamodb put-item \
+     --table-name semantic-layer-dev-parties \
+     --item '{
+       "pk":        {"S": "PARTY#PARTY000001"},
+       "sk":        {"S": "METADATA"},
+       "PartyID":   {"S": "PARTY000001"},
+       "FullName":  {"S": "Steven Allen"},
+       "BirthDate": {"S": "1997-06-09"}
+     }'
+   ```
+   Use the AWS CLI, SDK, `BatchWriteItem`, or your own ETL for bulk loads.
+3. **Replication is automatic.** Glue Zero-ETL streams each table into S3 Tables
+   (`zetl_<uuid>` namespace), and the NormalizedViews Glue job builds the Iceberg
    materialized views in the `normalized` namespace (initial run on deploy, then
-   every 6h). Confirm the `normalized` tables are populated before querying.
+   every 6h). Confirm the normalized tables are populated before querying:
+   ```bash
+   aws athena start-query-execution \
+     --query-string "SELECT COUNT(*) FROM normalized.party" \
+     --work-group <athena-workgroup-from-cdk-outputs>
+   ```
 
-> **Bringing data already in Glue/S3 instead?** You can also point the admin
-> "Select Data Sources" step at existing Glue Catalog databases/tables (including
-> S3 Tables / Iceberg) — the DynamoDB path above is optional.
+> **Adapting the schema to your domain?** The 12 entity tables and the
+> `normalized` views reflect an insurance reference model. To model a different
+> domain, change the table set in `cdk/lib/stacks/backend/dynamodb-stack.ts` and
+> the view definitions in `glue/create-normalized-views.py`, then redeploy.
+
+#### Option B — Point at data already in Glue / S3
+
+If your data is already catalogued, you can skip DynamoDB entirely. In the admin
+**Select Data Sources** step, choose existing Glue Catalog databases/tables
+(including S3 Tables / Iceberg). The ontology agent samples those sources
+directly, and Athena queries them through federation.
 
 ### Step 3 — Configure access and ontology patterns
 
 1. **Create Cognito users** — get the User Pool ID from CDK outputs, create an
-   admin user, and add it to the `Admins` group.
+   admin user, and add it to the `Admin` group.
 2. **Upload ontology patterns** — drop OWL design-pattern files into
    `data/ontology-docs/` (or copy to the artifacts bucket under
    `ontology-patterns/`) and trigger Knowledge Base ingestion.
@@ -553,13 +575,14 @@ Deployment takes approximately 35–50 minutes (includes ARM64 CodeBuild jobs fo
 For incremental testing, deploy a subset by stack name (Neptune + agents are the costliest stacks — leaving them off keeps cost low while you validate the data layer):
 
 ```bash
-cdk deploy semantic-layer-networking semantic-layer-dynamodb \
-           semantic-layer-glue-catalog semantic-layer-data-lake \
-           semantic-layer-zeroetl semantic-layer-normalized-views
+# Stack names use the deploy suffix (default 'dev'); substitute yours if set.
+cdk deploy semantic-layer-dev-networking semantic-layer-dev-dynamodb \
+           semantic-layer-dev-glue-catalog semantic-layer-dev-data-lake \
+           semantic-layer-dev-zeroetl semantic-layer-dev-normalized-views
 
 # Add Neptune + agents once data layer is verified:
-cdk deploy semantic-layer-neptune semantic-layer-bedrock-kb \
-           semantic-layer-athena semantic-layer-agentcore
+cdk deploy semantic-layer-dev-neptune semantic-layer-dev-bedrock-kb \
+           semantic-layer-dev-athena semantic-layer-dev-agentcore
 
 # Tear down:
 cdk destroy --all
@@ -580,14 +603,14 @@ pytest tests/unit/
 
 ### Post-Deployment
 
-See [Getting Started → Step 2–4](#step-2--load-your-data) for loading data,
+See [Getting Started → Step 2–4](#step-2--bring-your-own-data) for loading data,
 creating Cognito users, uploading ontology patterns, and accessing the app.
 
 ## Security Considerations
 
 ### Authentication & Authorization
 - Cognito User Pool with OAuth 2.0 + PKCE
-- User Groups: `Admins` (ontology management), `QueryUsers` (queries only)
+- User Groups: `Admin` (ontology management), `Users` (queries only)
 - JWT tokens (1-hour expiry) validated at API Gateway
 
 ### Network Security
@@ -618,7 +641,7 @@ The following table provides a rough monthly cost breakdown for deploying this V
 - 2,000 Lambda invocations/month for the FastAPI REST API (avg 10s duration, 2048 MB)
 - 2 AgentCore Runtimes (ontology + ontology-query): 100 sessions/month total (avg 10 min each) = 1,000 runtime minutes
 - Amazon Bedrock Claude Sonnet 4.6: ~4M input tokens, ~500K output tokens/month
-- Amazon Neptune: db.t3.medium cluster, ~10 GB RDF/OWL storage
+- Amazon Neptune: single `db.t3.medium` instance, ~10 GB RDF/OWL storage
 - Amazon Bedrock Knowledge Base: 1 KB (S3 Vectors backend) — ontology-patterns; Titan Embed Text v2 embeddings
 - DynamoDB: 13 tables (12 insurance + 1 metadata), on-demand capacity, ~5 GB storage, ~50K R/W operations
 - S3: 6 buckets (~30 GB total)
@@ -652,7 +675,7 @@ The following table provides a rough monthly cost breakdown for deploying this V
 | Amazon Bedrock Guardrails        | ~$0.50         |
 | **Total (Moderate Usage)**       | **~$157**      |
 
-> **Note:** Amazon Neptune is the largest single cost (~$50/month for a db.t3.medium cluster). For intermittent or dev/test usage, Neptune Serverless can reduce this further. Bedrock model inference and AgentCore Runtime are the next largest line items.
+> **Note:** Amazon Neptune is the largest single cost (~$50/month for a single `db.t3.medium` instance). For intermittent or dev/test usage, Neptune Serverless can reduce this further; for production, scale up the instance class and add a reader for HA. Bedrock model inference and AgentCore Runtime are the next largest line items.
 
 ## License
 
@@ -661,3 +684,5 @@ This library is licensed under the MIT-0 License. See the LICENSE file.
 ## Authors
 
 - Felix Huthmacher, Senior Applied AI Architect ([github - fhuthmacher](https://github.com/fhuthmacher))
+- Yiwen Zhang, Principal Applied AI Architect ([github - Yiwen-Zhang](https://github.com/Yiwen-Zhang))
+- Saurabh Sarkar, Senior Applied AI Architect ([github - srbhsrkr](https://github.com/srbhsrkr))

@@ -99,25 +99,17 @@ export class NeptuneStack extends cdk.Stack {
     this.cluster.addDependency(subnetGroup);
     this.cluster.addDependency(parameterGroup);
 
-    // Primary instance
+    // Primary instance.
+    // db.t3.medium keeps this sample/demo cluster low-cost. Scale up the
+    // instance class (and add a reader instance for HA) for production loads.
     const primaryInstance = new neptune.CfnDBInstance(this, 'NeptunePrimaryInstance', {
-      dbInstanceClass: 'db.r6g.xlarge',
+      dbInstanceClass: 'db.t3.medium',
       dbClusterIdentifier: this.cluster.ref,
       dbInstanceIdentifier: `${props.projectName}-neptune-instance-1`,
       autoMinorVersionUpgrade: true,
     });
 
     primaryInstance.addDependency(this.cluster);
-
-    // Reader instance for high availability
-    const readerInstance = new neptune.CfnDBInstance(this, 'NeptuneReaderInstance', {
-      dbInstanceClass: 'db.r6g.large',
-      dbClusterIdentifier: this.cluster.ref,
-      dbInstanceIdentifier: `${props.projectName}-neptune-instance-2`,
-      autoMinorVersionUpgrade: true,
-    });
-
-    readerInstance.addDependency(this.cluster);
 
     this.clusterEndpoint = this.cluster.attrEndpoint;
     this.readerEndpoint = this.cluster.attrReadEndpoint;
