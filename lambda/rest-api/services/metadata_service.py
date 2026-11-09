@@ -5,44 +5,30 @@ This service handles:
 - Starting metadata enrichment jobs
 - Tracking enrichment progress
 - Retrieving enrichment status
-- Submitting and polling metadata natural-language queries (async, DynamoDB-backed)
+- Reading AI-enriched per-table metadata from S3 (Bedrock KB source of truth)
 
-Metadata query architecture (mirrors query_service.py):
-  submit_metadata_query()
-    → stores {status: processing} in QUERY_RESULTS_TABLE (queryType=metadata)
-    → self-invokes Lambda async (_metadata_worker event)
-    → returns {queryId, status: processing} immediately
-
-  process_metadata_worker_event()
-    → called by async self-invocation
-    → invokes metadata query AgentCore runtime
-    → writes full result JSON to S3: metadata-query-results/<queryId>/result.json
-    → updates DynamoDB: {status: completed, result_s3_key}
-
-  get_metadata_query_status()  → DynamoDB read only (fast)
-  get_metadata_query_result()  → DynamoDB → S3 fetch
+Natural-language metadata querying runs over the streaming AG-UI chat path
+(chat AgentCore Gateway → metadata query AgentCore runtime). This service no
+longer exposes an async submit/status/result surface.
 """
 
-import json
 import logging
 import os
 import re
-import uuid
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 import boto3
 from boto3.dynamodb.conditions import Key
 
 from services.agentcore_service import AgentCoreService
+from services.delta_planner_service import DeltaPlannerService
+from services.glue_service import GlueService
 from services.guardrail_service import GuardrailService
 from services.ontology_service import convert_decimals
 
 logger = logging.getLogger(__name__)
-
-_RESULT_S3_PREFIX = "metadata-query-results"
-_TTL_DAYS = 7
 
 
 def _version_num(version_str: str) -> int:
@@ -67,10 +53,8 @@ class MetadataService:
         self.region = os.environ.get('AWS_REGION', 'us-east-1')
         self.dynamodb = boto3.resource('dynamodb', region_name=self.region)
         self.metadata_table_name = os.getenv('ONTOLOGY_METADATA_TABLE', 'semantic-layer-metadata')
-        self.query_table_name = os.getenv('QUERY_RESULTS_TABLE', 'semantic-layer-query-results')
         self.artifacts_bucket = os.getenv('ARTIFACTS_BUCKET', '')
         self._metadata_table = self.dynamodb.Table(self.metadata_table_name)
-        self._query_table = None  # lazy init
         self.agentcore_service = AgentCoreService()
         self.guardrail = GuardrailService()
 
@@ -94,6 +78,59 @@ class MetadataService:
 
         return max(items, key=lambda item: _version_num(item.get('version', 'v0')))
 
+    def compute_delta_plan(self, id: str) -> Dict[str, Any]:
+        """Compute (do not run) the delta plan for a Semantic-RAG layer.
+
+        Args:
+            id: The layer/config id.
+
+        Returns:
+            The DeltaPlan dict (see DeltaPlannerService.compute_plan).
+        """
+        planner = DeltaPlannerService(
+            metadata_table=self._metadata_table,
+            glue_service=GlueService(),
+            artifacts_bucket=self.artifacts_bucket,
+            region=self.region,
+        )
+        return planner.compute_plan(id, layer_type="SemanticRAG")
+
+    def cleanup_removed_for_plan(self, id: str, plan: Dict[str, Any]) -> None:
+        """Run artifact cleanup for the plan's removed tables (RAG: S3 docs).
+
+        A removed table is NOT in current dataSources, so its catalog is resolved
+        from the STORED fingerprint (Task 2 stores catalogId for exactly this). A
+        table with no stored fingerprint defaults to AWSDataCatalog and logs a
+        warning (its S3 Tables doc may be orphaned rather than deleted).
+
+        Args:
+            id: The layer/config id.
+            plan: A DeltaPlan (or {'removed': [...]}) whose 'removed' list drives cleanup.
+
+        Returns:
+            None.
+        """
+        if not plan.get("removed"):
+            return
+        config = self._get_latest_metadata_item(id) or {}
+        version = config.get("version", "v1")
+        stored = config.get("tableFingerprints") or {}
+        removed = []
+        for dt in plan["removed"]:
+            db, tbl = dt.split(".", 1)
+            fp = stored.get(dt) or {}
+            cat = fp.get("catalogId", "AWSDataCatalog")
+            if not fp:
+                logger.warning(
+                    "cleanup: removed table %s has no stored fingerprint; "
+                    "defaulting catalog to AWSDataCatalog (S3 Tables doc may be "
+                    "orphaned rather than deleted)", dt)
+            removed.append((db, tbl, cat))
+        DeltaPlannerService(
+            metadata_table=self._metadata_table, glue_service=GlueService(),
+            artifacts_bucket=self.artifacts_bucket, region=self.region,
+        ).cleanup_removed(id, version=version, layer_type="SemanticRAG", removed=removed)
+
     def get_metadata_versions(self, id: str) -> list:
         """Return all version records for id, sorted newest-first."""
         resp = self._metadata_table.query(KeyConditionExpression=Key('id').eq(id))
@@ -108,61 +145,6 @@ class MetadataService:
             }
             for i in items
         ])
-
-    # ------------------------------------------------------------------
-    # DynamoDB helpers (query tracking)
-    # ------------------------------------------------------------------
-
-    def _get_query_table(self):
-        if self._query_table is None:
-            self._query_table = self.dynamodb.Table(self.query_table_name)
-        return self._query_table
-
-    @staticmethod
-    def _ttl_epoch() -> int:
-        return int((datetime.now(timezone.utc) + timedelta(days=_TTL_DAYS)).timestamp())
-
-    def _put_query_item(self, query_id: str, item: dict):
-        self._get_query_table().put_item(Item={'queryId': query_id, **item})
-
-    def _get_query_item(self, query_id: str) -> Optional[dict]:
-        resp = self._get_query_table().get_item(Key={'queryId': query_id})
-        return resp.get('Item')
-
-    def _update_query_item(self, query_id: str, updates: dict):
-        set_expr = ', '.join(f'#{k} = :{k}' for k in updates)
-        names = {f'#{k}': k for k in updates}
-        values = {f':{k}': v for k, v in updates.items()}
-        self._get_query_table().update_item(
-            Key={'queryId': query_id},
-            UpdateExpression=f'SET {set_expr}',
-            ExpressionAttributeNames=names,
-            ExpressionAttributeValues=values,
-        )
-
-    # ------------------------------------------------------------------
-    # S3 helpers (result payload)
-    # ------------------------------------------------------------------
-
-    def _result_s3_key(self, query_id: str) -> str:
-        return f"{_RESULT_S3_PREFIX}/{query_id}/result.json"
-
-    def _write_result_to_s3(self, query_id: str, result: dict) -> str:
-        s3 = boto3.client('s3', region_name=self.region)
-        key = self._result_s3_key(query_id)
-        s3.put_object(
-            Bucket=self.artifacts_bucket,
-            Key=key,
-            Body=json.dumps(result, ensure_ascii=False).encode('utf-8'),
-            ContentType='application/json',
-        )
-        logger.info(f"Metadata query result written to s3://{self.artifacts_bucket}/{key}")
-        return key
-
-    def _read_result_from_s3(self, s3_key: str) -> dict:
-        s3 = boto3.client('s3', region_name=self.region)
-        obj = s3.get_object(Bucket=self.artifacts_bucket, Key=s3_key)
-        return json.loads(obj['Body'].read().decode('utf-8'))
 
     def start_metadata_enrichment(
         self, id: str,
@@ -243,6 +225,18 @@ class MetadataService:
         if annotations:
             update_expr += ', enrichmentAnnotations = :annotations'
             expr_values[':annotations'] = annotations
+
+        # Delta scope handling MUST be the last modification to update_expr so
+        # that all comma-joined SET clauses stay contiguous and the REMOVE
+        # (which takes no leading comma) is the final token. DynamoDB requires
+        # every SET clause to precede the REMOVE clause in a single expression.
+        if target_tables:
+            # Delta build: persist the explicit scope so the agent filters its loop.
+            update_expr += ', deltaTargetTables = :delta'
+            expr_values[':delta'] = list(target_tables)
+        else:
+            # Full build: clear any stale delta scope so the agent processes everything.
+            update_expr += ' REMOVE deltaTargetTables'
 
         self._metadata_table.update_item(
             Key={'id': job_id, 'version': config['version']},
@@ -335,221 +329,74 @@ class MetadataService:
             'error': item.get('error'),
         }
 
-    def submit_metadata_query(
-        self, question: str, id: str
+    def get_table_kb_metadata(
+        self,
+        database_name: str,
+        table_name: str,
+        catalog_id: str,
+        semantic_layer_id: str,
+        semantic_layer_version: str,
     ) -> Dict[str, Any]:
-        """
-        Accept a metadata query and return immediately.
-        Processing happens asynchronously via Lambda self-invocation.
-
-        dataSources (tables + catalogIds) are resolved here from the metadata
-        config in DynamoDB so that the caller never needs to pass database/catalog
-        details — a single metadata layer can span multiple databases.
-
-        Args:
-            question: The natural language question
-            id: metadata config ID; dataSources are read from DynamoDB
-
-        Returns:
-            Dictionary with queryId, question, and status='processing'
-        """
-        # Resolve dataSources from the metadata config
-        config = self._get_latest_metadata_item(id)
-        if not config:
-            raise ValueError(f"metadata config not found: {id}")
-
-        data_sources = config.get('dataSources', [])
-        if not data_sources:
-            raise ValueError(f"No dataSources configured for metadata: {id}")
-
-        query_id = str(uuid.uuid4())
-        now = datetime.now(timezone.utc).isoformat()
-
-        self._put_query_item(query_id, {
-            'queryType': 'metadata',
-            'status': 'processing',
-            'question': question,
-            'id': id,
-            'createdAt': now,
-            'updatedAt': now,
-            'expires': self._ttl_epoch(),
-        })
-
-        function_name = os.environ.get('AWS_LAMBDA_FUNCTION_NAME')
-        if function_name:
-            boto3.client('lambda', region_name=self.region).invoke(
-                FunctionName=function_name,
-                InvocationType='Event',
-                Payload=json.dumps({
-                    '_metadata_worker': True,
-                    'query_id': query_id,
-                    'question': question,
-                    'id': id,
-                }).encode(),
-            )
-            logger.info(f"Async metadata worker invoked for query {query_id}")
-        else:
-            logger.error("AWS_LAMBDA_FUNCTION_NAME not set — metadata worker cannot be invoked")
-
-        return {
-            'queryId': query_id,
-            'question': question,
-            'status': 'processing',
-        }
-
-    def process_metadata_worker_event(self, event: dict):
-        """
-        Called by the async Lambda self-invocation (_metadata_worker event).
-        Runs the AgentCore metadata query, writes result to S3, updates DynamoDB.
-        """
-        query_id = event['query_id']
-        question = event['question']
-        id = event['id']
-
-        logger.info(f"Metadata worker started for query {query_id}")
-        now = datetime.now(timezone.utc).isoformat()
-
-        # --- INPUT guardrail pre-screen ---
-        input_check = self.guardrail.apply(question, source='INPUT')
-        if input_check['blocked']:
-            logger.warning(f"Metadata query {query_id} blocked by input guardrail")
-            self._update_query_item(query_id, {
-                'status': 'blocked',
-                'error': input_check['message'],
-                'updatedAt': datetime.now(timezone.utc).isoformat(),
-            })
-            return
-
-        try:
-            resp = self.agentcore_service.invoke_metadata_query_agent(
-                question=question,
-                id=id,
-            )
-            agent_data = resp.get('data', {})
-
-            # agent_data is already parsed JSON from the agent response;
-            # if the agent returned plain text it will be in agent_data['result']
-            if 'result' in agent_data and len(agent_data) == 1:
-                raw = agent_data['result']
-                try:
-                    parsed = json.loads(raw) if isinstance(raw, str) else raw
-                except (json.JSONDecodeError, ValueError):
-                    parsed = {'answer': raw}
-            else:
-                parsed = agent_data
-
-            result = {
-                'queryId': query_id,
-                'question': question,
-                'answer': parsed.get('answer', ''),
-                'sql_query': parsed.get('sql_query', ''),
-                'results': parsed.get('results', []),
-                'n_quads': parsed.get('n_quads', []),
-                'reasoning': parsed.get('reasoning', {}),
-            }
-
-            # --- OUTPUT guardrail post-screen ---
-            answer_text = result.get('answer', '')
-            if answer_text:
-                output_check = self.guardrail.apply(answer_text, source='OUTPUT')
-                if output_check['blocked']:
-                    logger.warning(f"Metadata query {query_id} answer blocked by output guardrail")
-                    result['answer'] = output_check['message']
-                    result['results'] = []
-                    result['sql_query'] = ''
-
-            s3_key = self._write_result_to_s3(query_id, result)
-
-            self._update_query_item(query_id, {
-                'status': 'completed',
-                'result_s3_key': s3_key,
-                'updatedAt': datetime.now(timezone.utc).isoformat(),
-            })
-            logger.info(f"Metadata query {query_id} completed")
-
-        except Exception as e:
-            logger.error(f"Metadata worker error for query {query_id}: {e}", exc_info=True)
-            self._update_query_item(query_id, {
-                'status': 'failed',
-                'error': str(e),
-                'updatedAt': datetime.now(timezone.utc).isoformat(),
-            })
-
-    def get_metadata_query_status(self, query_id: str) -> Dict[str, Any]:
-        """
-        Fast status check — reads DynamoDB only, no S3 call.
-
-        Args:
-            query_id: The query ID to check
-
-        Returns:
-            Dictionary with queryId and status
-        """
-        item = self._get_query_item(query_id)
-        if not item:
-            return {'queryId': query_id, 'status': 'NOT_FOUND'}
-        return {
-            'queryId': query_id,
-            'status': item.get('status', 'processing'),
-            'question': item.get('question', ''),
-            'updatedAt': item.get('updatedAt'),
-        }
-
-    def get_table_kb_metadata(self, database_name: str, table_name: str, catalog_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Read the AI-enriched metadata document from S3 (written by the metadata agent)
         and return a structured payload: description + columns list.
 
-        S3 key: metadata/{catalog_id}/{database_name}/{table_name}.md
-        Falls back to metadata/{database_name}/{table_name}.md for legacy documents.
+        S3 key (matches save_metadata_document_to_s3 in agents/metadata_agent/main.py):
+          metadata/{semantic_layer_id}/{semantic_layer_version}/{catalog_id}/{database_name}/{table_name}.md
         """
         if not self.artifacts_bucket:
-            return {'success': False, 'error': 'ARTIFACTS_BUCKET not configured'}
+            raise ValueError('ARTIFACTS_BUCKET not configured')
 
-        # Primary key matches the path the agent writes (includes catalog_id)
-        key = f'metadata/{catalog_id}/{database_name}/{table_name}.md' if catalog_id else f'metadata/{database_name}/{table_name}.md'
-        fallback_key = f'metadata/{database_name}/{table_name}.md' if catalog_id else None
+        key = (
+            f'metadata/{semantic_layer_id}/{semantic_layer_version}/'
+            f'{catalog_id}/{database_name}/{table_name}.md'
+        )
         s3 = boto3.client('s3', region_name=self.region)
 
-        def _fetch_key(s3_key: str) -> Optional[str]:
-            """Return decoded content or None if the key does not exist."""
-            try:
-                obj = s3.get_object(Bucket=self.artifacts_bucket, Key=s3_key)
-                return obj['Body'].read().decode('utf-8')
-            except Exception as e:
-                error_code = (e.response.get('Error', {}).get('Code', '')
-                              if hasattr(e, 'response') and isinstance(e.response, dict)
-                              else '')
-                if error_code == 'NoSuchKey' or 'NoSuchKey' in type(e).__name__:
-                    return None
-                raise
-
         try:
-            content = _fetch_key(key)
-            if content is None and fallback_key:
-                logger.info(f"Primary key not found, trying fallback: {fallback_key}")
-                content = _fetch_key(fallback_key)
-            if content is None:
-                return {'success': False, 'error': 'Metadata not yet generated for this table'}
-            parsed = self._parse_metadata_markdown(content)
-            return {
-                'success': True,
-                'databaseName': database_name,
-                'tableName': table_name,
-                **parsed,
-            }
+            obj = s3.get_object(Bucket=self.artifacts_bucket, Key=key)
+            content = obj['Body'].read().decode('utf-8')
         except Exception as e:
+            error_code = (e.response.get('Error', {}).get('Code', '')
+                          if hasattr(e, 'response') and isinstance(e.response, dict)
+                          else '')
+            if error_code == 'NoSuchKey' or 'NoSuchKey' in type(e).__name__:
+                logger.info(f"KB metadata key not found: {key}")
+                return {'success': False, 'error': 'Metadata not yet generated for this table'}
             logger.error(f"Error reading KB metadata for {database_name}.{table_name}: {e}")
             return {'success': False, 'error': str(e)}
+
+        logger.info(f"Loaded KB metadata from {key}")
+        parsed = self._parse_metadata_markdown(content)
+        return {
+            'success': True,
+            'databaseName': database_name,
+            'tableName': table_name,
+            **parsed,
+        }
 
     def _parse_metadata_markdown(self, content: str) -> Dict[str, Any]:
         """
         Parse the structured markdown produced by the metadata agent and return
-        a dict with 'description' (str) and 'columns' (list of {name, type, description}).
+        a dict with 'description' (str), 'columns' (list of {name, type,
+        description}), and 'sections' — an ordered list of every ``## <Heading>``
+        block ({title, body}) so the UI can render the FULL curated document
+        (Business Purpose, Business Concepts, Reference Tables, Common Query
+        Patterns, ACORD Source Path, Notes, …), not just Overview + Columns.
         """
         import re
 
-        result: Dict[str, Any] = {'description': '', 'columns': []}
+        result: Dict[str, Any] = {'description': '', 'columns': [], 'sections': []}
+
+        # Extract every "## Heading\n body" block in document order. The leading
+        # "# <title>" H1 (the table id) is intentionally skipped (it's redundant
+        # with the table name already shown in the UI).
+        for m in re.finditer(r'^##\s+(.+?)\s*\n(.*?)(?=^##\s|\Z)', content,
+                              re.DOTALL | re.MULTILINE):
+            title = m.group(1).strip()
+            body = m.group(2).strip()
+            if title:
+                result['sections'].append({'title': title, 'body': body})
 
         # Extract Overview section (between ## Overview and the next ##)
         # Allow an optional blank line after the heading (LLMs commonly emit one)
@@ -578,43 +425,3 @@ class MetadataService:
                     })
 
         return result
-
-    def get_metadata_query_result(self, query_id: str) -> Dict[str, Any]:
-        """
-        Return the full structured result.
-        Fetches from S3 when completed; returns error info when failed.
-
-        Args:
-            query_id: The query ID to retrieve
-
-        Returns:
-            Dictionary with queryId, status, sql, columns, rows, kbSources,
-            kbContext, and error (if any)
-        """
-        item = self._get_query_item(query_id)
-        if not item:
-            return {'queryId': query_id, 'status': 'not_found'}
-
-        base = {
-            'queryId': query_id,
-            'status': item.get('status'),
-            'question': item.get('question', ''),
-        }
-
-        if item.get('status') == 'completed':
-            s3_key = item.get('result_s3_key')
-            if s3_key:
-                full_result = self._read_result_from_s3(s3_key)
-                return {**base, **full_result}
-            return {**base, 'answer': '', 'sql_query': '', 'results': [], 'n_quads': [], 'reasoning': {}}
-
-        if item.get('status') == 'failed':
-            return {**base, 'error': item.get('error', 'Unknown error'),
-                    'answer': '', 'sql_query': '', 'results': [], 'n_quads': [], 'reasoning': {}}
-
-        if item.get('status') == 'blocked':
-            return {**base, 'blocked': True, 'error': item.get('error', 'Content blocked by safety policy.'),
-                    'answer': '', 'sql_query': '', 'results': [], 'n_quads': [], 'reasoning': {}}
-
-        # still processing
-        return {**base, 'answer': '', 'sql_query': '', 'results': [], 'n_quads': [], 'reasoning': {}}

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from "react";
 import {
   Container,
   Header,
@@ -10,14 +10,15 @@ import {
   ExpandableSection,
   StatusIndicator,
   Badge,
-} from '@cloudscape-design/components';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { dataSourceAPI, ontologyAPI } from '../../services/api';
+} from "@cloudscape-design/components";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { dataSourceAPI, ontologyAPI } from "../../services/api";
+import CancelDraftButton from "../../components/CancelDraftButton";
 
 export default function ReviewMetadata({ user }) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const id = searchParams.get('id');
+  const id = searchParams.get("id");
 
   const [metadata, setMetadata] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -25,7 +26,7 @@ export default function ReviewMetadata({ user }) {
 
   useEffect(() => {
     if (!id) {
-      setError('No ID provided. Please complete previous steps first.');
+      setError("No ID provided. Please complete previous steps first.");
       return;
     }
     loadMetadata();
@@ -39,7 +40,7 @@ export default function ReviewMetadata({ user }) {
       // Get ontology config to retrieve selected data sources
       const configResult = await ontologyAPI.getOntologyConfig(id);
       if (!configResult.success) {
-        setError('Failed to load semantic layer configuration');
+        setError("Failed to load semantic layer configuration");
         setLoading(false);
         return;
       }
@@ -48,7 +49,9 @@ export default function ReviewMetadata({ user }) {
       const dataSources = configResult.data.dataSources || [];
 
       if (dataSources.length === 0) {
-        setError('No data sources found. Please go back and select data sources.');
+        setError(
+          "No data sources found. Please go back and select data sources.",
+        );
         setLoading(false);
         return;
       }
@@ -60,25 +63,26 @@ export default function ReviewMetadata({ user }) {
         // Transform backend response to match frontend expectations
         const backendData = extractResult.data;
         const transformedMetadata = {
-          tables: backendData.dataSources?.map(ds => ({
-            tableName: `${ds.database}.${ds.table}`,
-            database: ds.database,
-            table: ds.table,
-            description: ds.metadata?.description || ds.description || null,
-            columns: ds.metadata?.columns || []
-          })) || [],
+          tables:
+            backendData.dataSources?.map((ds) => ({
+              tableName: `${ds.database}.${ds.table}`,
+              database: ds.database,
+              table: ds.table,
+              description: ds.metadata?.description || ds.description || null,
+              columns: ds.metadata?.columns || [],
+            })) || [],
           relationships: backendData.relationships || [],
           uploadedDocuments: configResult.data.uploadedDocuments || [],
           totalTables: backendData.totalTables || 0,
-          totalColumns: backendData.totalColumns || 0
+          totalColumns: backendData.totalColumns || 0,
         };
 
         setMetadata(transformedMetadata);
       } else {
-        setError(extractResult.error || 'Failed to extract metadata');
+        setError(extractResult.error || "Failed to extract metadata");
       }
     } catch (err) {
-      setError(err.message || 'An error occurred');
+      setError(err.message || "An error occurred");
     } finally {
       setLoading(false);
     }
@@ -93,6 +97,7 @@ export default function ReviewMetadata({ user }) {
       <Header
         variant="h1"
         description="Step 3 of 5: Review metadata extracted from your selected data sources"
+        actions={<CancelDraftButton ontologyId={id} />}
       >
         Review Metadata
       </Header>
@@ -144,34 +149,38 @@ export default function ReviewMetadata({ user }) {
                   >
                     <SpaceBetween size="s">
                       {table.description && (
-                        <Box color="text-body-secondary">{table.description}</Box>
-                      )}
-                    <Table
-                      columnDefinitions={[
-                        {
-                          id: 'name',
-                          header: 'Column Name',
-                          cell: (item) => item.name || '-',
-                        },
-                        {
-                          id: 'type',
-                          header: 'Data Type',
-                          cell: (item) => <Badge>{item.type || 'unknown'}</Badge>,
-                        },
-                        {
-                          id: 'comment',
-                          header: 'Description',
-                          cell: (item) => item.comment || '-',
-                        },
-                      ]}
-                      items={table.columns || []}
-                      variant="embedded"
-                      empty={
-                        <Box textAlign="center" color="text-status-inactive">
-                          No columns found
+                        <Box color="text-body-secondary">
+                          {table.description}
                         </Box>
-                      }
-                    />
+                      )}
+                      <Table
+                        columnDefinitions={[
+                          {
+                            id: "name",
+                            header: "Column Name",
+                            cell: (item) => item.name || "-",
+                          },
+                          {
+                            id: "type",
+                            header: "Data Type",
+                            cell: (item) => (
+                              <Badge>{item.type || "unknown"}</Badge>
+                            ),
+                          },
+                          {
+                            id: "comment",
+                            header: "Description",
+                            cell: (item) => item.comment || "-",
+                          },
+                        ]}
+                        items={table.columns || []}
+                        variant="embedded"
+                        empty={
+                          <Box textAlign="center" color="text-status-inactive">
+                            No columns found
+                          </Box>
+                        }
+                      />
                     </SpaceBetween>
                   </ExpandableSection>
                 ))}
@@ -183,88 +192,101 @@ export default function ReviewMetadata({ user }) {
             )}
           </Container>
 
-          {metadata.uploadedDocuments && metadata.uploadedDocuments.length > 0 && (
-            <Container
-              header={
-                <Header
-                  variant="h2"
-                  info={<Badge color="blue">{metadata.uploadedDocuments.length} Files</Badge>}
-                >
-                  Uploaded Reference Documents
-                </Header>
-              }
-            >
-              <Table
-                columnDefinitions={[
-                  {
-                    id: 'filename',
-                    header: 'File Name',
-                    cell: (item) => item.filename || '-',
-                  },
-                  {
-                    id: 'size',
-                    header: 'Size',
-                    cell: (item) => item.size ? `${(item.size / 1024).toFixed(2)} KB` : '-',
-                  },
-                  {
-                    id: 'path',
-                    header: 'Location',
-                    cell: (item) => (
-                      <Box fontSize="body-s" color="text-body-secondary">
-                        {item.path || '-'}
-                      </Box>
-                    ),
-                  },
-                ]}
-                items={metadata.uploadedDocuments}
-                variant="embedded"
-                empty={
-                  <Box textAlign="center" color="text-status-inactive">
-                    No documents uploaded
-                  </Box>
+          {metadata.uploadedDocuments &&
+            metadata.uploadedDocuments.length > 0 && (
+              <Container
+                header={
+                  <Header
+                    variant="h2"
+                    info={
+                      <Badge color="blue">
+                        {metadata.uploadedDocuments.length} Files
+                      </Badge>
+                    }
+                  >
+                    Uploaded Reference Documents
+                  </Header>
                 }
-              />
-            </Container>
-          )}
+              >
+                <Table
+                  columnDefinitions={[
+                    {
+                      id: "filename",
+                      header: "File Name",
+                      cell: (item) => item.filename || "-",
+                    },
+                    {
+                      id: "size",
+                      header: "Size",
+                      cell: (item) =>
+                        item.size ? `${(item.size / 1024).toFixed(2)} KB` : "-",
+                    },
+                    {
+                      id: "path",
+                      header: "Location",
+                      cell: (item) => (
+                        <Box fontSize="body-s" color="text-body-secondary">
+                          {item.path || "-"}
+                        </Box>
+                      ),
+                    },
+                  ]}
+                  items={metadata.uploadedDocuments}
+                  variant="embedded"
+                  empty={
+                    <Box textAlign="center" color="text-status-inactive">
+                      No documents uploaded
+                    </Box>
+                  }
+                />
+              </Container>
+            )}
 
           {metadata.relationships && metadata.relationships.length > 0 && (
             <Container
               header={
                 <Header
                   variant="h2"
-                  info={<Badge color="green">{metadata.relationships.length} Detected</Badge>}
+                  info={
+                    <Badge color="green">
+                      {metadata.relationships.length} Detected
+                    </Badge>
+                  }
                 >
                   Potential Table Relationships
                 </Header>
               }
             >
               <Alert type="info">
-                Relationships are detected based on column naming patterns (e.g., columns ending with "_id").
-                These are suggestions and may require verification.
+                Relationships are detected based on column naming patterns
+                (e.g., columns ending with "_id"). These are suggestions and may
+                require verification.
               </Alert>
-              <Box margin={{ top: 's' }}>
+              <Box margin={{ top: "s" }}>
                 <Table
                   columnDefinitions={[
                     {
-                      id: 'source',
-                      header: 'Source Table',
-                      cell: (item) => item.sourceTable || '-',
+                      id: "source",
+                      header: "Source Table",
+                      cell: (item) => item.sourceTable || "-",
                     },
                     {
-                      id: 'column',
-                      header: 'Source Column',
-                      cell: (item) => <Badge>{item.sourceColumn || '-'}</Badge>,
+                      id: "column",
+                      header: "Source Column",
+                      cell: (item) => <Badge>{item.sourceColumn || "-"}</Badge>,
                     },
                     {
-                      id: 'target',
-                      header: 'Possible Target',
-                      cell: (item) => item.targetTable || '-',
+                      id: "target",
+                      header: "Possible Target",
+                      cell: (item) => item.targetTable || "-",
                     },
                     {
-                      id: 'type',
-                      header: 'Type',
+                      id: "type",
+                      header: "Type",
                       cell: (item) => (
-                        <Badge color="blue">{item.relationship || 'unknown'}</Badge>
+                        <Badge color="blue">
+                          {item.relationship || "unknown"}
+                        </Badge>
                       ),
                     },
                   ]}
@@ -289,21 +311,33 @@ export default function ReviewMetadata({ user }) {
                 <SpaceBetween size="xs">
                   <Box variant="h4">Summary</Box>
                   <Box variant="p">
-                    • <strong>{metadata.totalTables || 0} tables</strong> selected with{' '}
-                    <strong>{metadata.totalColumns || 0} columns</strong> in total
+                    • <strong>{metadata.totalTables || 0} tables</strong>{" "}
+                    selected with{" "}
+                    <strong>{metadata.totalColumns || 0} columns</strong> in
+                    total
                   </Box>
-                  {metadata.uploadedDocuments && metadata.uploadedDocuments.length > 0 && (
-                    <Box variant="p">
-                      • <strong>{metadata.uploadedDocuments.length} reference documents</strong> uploaded
-                      to provide additional context
-                    </Box>
-                  )}
-                  {metadata.relationships && metadata.relationships.length > 0 && (
-                    <Box variant="p">
-                      • <strong>{metadata.relationships.length} potential relationships</strong> detected
-                      based on naming patterns
-                    </Box>
-                  )}
+                  {metadata.uploadedDocuments &&
+                    metadata.uploadedDocuments.length > 0 && (
+                      <Box variant="p">
+                        •{" "}
+                        <strong>
+                          {metadata.uploadedDocuments.length} reference
+                          documents
+                        </strong>{" "}
+                        uploaded to provide additional context
+                      </Box>
+                    )}
+                  {metadata.relationships &&
+                    metadata.relationships.length > 0 && (
+                      <Box variant="p">
+                        •{" "}
+                        <strong>
+                          {metadata.relationships.length} potential
+                          relationships
+                        </strong>{" "}
+                        detected based on naming patterns
+                      </Box>
+                    )}
                 </SpaceBetween>
               </Box>
             </SpaceBetween>
@@ -311,7 +345,9 @@ export default function ReviewMetadata({ user }) {
 
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => navigate(`/admin/select-datasources?id=${id}`)}>
+              <Button
+                onClick={() => navigate(`/admin/select-datasources?id=${id}`)}
+              >
                 Back
               </Button>
               <Button variant="primary" onClick={handleContinue}>

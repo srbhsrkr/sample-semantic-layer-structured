@@ -11,15 +11,26 @@ import uuid
 from bedrock_agentcore import BedrockAgentCoreApp
 try:
     from opentelemetry import baggage as _otel_baggage
+    from opentelemetry import context as _otel_context
 except ImportError:
     _otel_baggage = None  # type: ignore
+    _otel_context = None  # type: ignore
 from strands import Agent, tool
 from strands.models import BedrockModel
 from boto3.dynamodb.conditions import Key
 from typing import Dict, Any, Optional
 
-from .token_manager import count_tokens
+try:
+    from agents.shared.token_manager import count_tokens
+    from agents.shared.boto_session import get_boto_session
+except ImportError:
+    from shared.token_manager import count_tokens  # type: ignore
+    from shared.boto_session import get_boto_session  # type: ignore
 from .query_prompts import SYSTEM_PROMPT, QUERY_MODEL_ID
+try:
+    from agents.shared.advisory import build_advisory_answer
+except ImportError:
+    from shared.advisory import build_advisory_answer  # type: ignore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,14 +48,18 @@ metadata_table_name = os.getenv('ONTOLOGY_METADATA_TABLE', 'semantic-layer-metad
 dynamodb = boto3.resource('dynamodb', region_name=region)
 metadata_table = dynamodb.Table(metadata_table_name)
 
-_boto_session: Optional[boto3.Session] = None
+
+def metrics_table():
+    """Return the boto3 Table resource for the governed-metrics catalog.
+
+    Mirrors the metadata-query agent's accessor so advisory answers can enumerate
+    a layer's governed metrics (keyed by layer id only — the namespace IS the id).
+    """
+    return dynamodb.Table(os.environ.get('METRICS_TABLE', 'semantic-layer-metrics'))
 
 
-def get_boto_session() -> boto3.Session:
-    global _boto_session
-    if _boto_session is None:
-        _boto_session = boto3.Session(region_name=os.getenv('AWS_REGION', 'us-east-1'))
-    return _boto_session
+# boto3 session management (get_boto_session) is provided by
+# agents.shared.boto_session, imported above.
 
 
 def get_latest_metadata_item(id: str) -> Optional[dict]:
@@ -113,8 +128,12 @@ def retrieve_kb_context(user_query: str) -> str:
 def create_suggestions_agent() -> Agent:
     model = BedrockModel(
         model_id=QUERY_MODEL_ID,
-        temperature=0.3,
-        max_tokens=2000,
+        # `temperature` omitted — Sonnet 5 has adaptive thinking ON by default and
+        # Bedrock rejects temperature/top_p/top_k when thinking is active
+        # (ValidationException on ConverseStream, same as Opus 4.8). max_tokens
+        # raised from 2000 to leave headroom for adaptive thinking tokens, which
+        # share the OUTPUT budget.
+        max_tokens=4000,
         boto_session=get_boto_session(),
     )
     return Agent(
@@ -124,17 +143,56 @@ def create_suggestions_agent() -> Agent:
     )
 
 
+def _synthesize_advisory(prompt: str) -> str:
+    """Run the advisory synthesis prompt through the model and return its text.
+
+    A bare model call (no tools) — the advisory module has already assembled the
+    grounded metrics + schema context into ``prompt``, so the model only writes
+    prose. Used as the ``synthesize`` callable for ``build_advisory_answer``.
+
+    :param prompt: The fully-formed advisory prompt.
+    :returns: The model's text answer (empty string on an unexpected shape).
+    """
+    model = BedrockModel(
+        model_id=QUERY_MODEL_ID,
+        # `temperature` omitted — Sonnet 5 adaptive thinking is on by default and
+        # is incompatible with temperature (see create_suggestions_agent).
+        max_tokens=4000,
+        boto_session=get_boto_session(),
+    )
+    # A tool-less Agent is the simplest way to get one prose completion from the
+    # same Strands/Bedrock path the suggestions agent already uses.
+    agent = Agent(model=model, system_prompt="You are a helpful semantic-layer advisor.")
+    response = agent(prompt)
+    try:
+        return response.message['content'][0]['text']
+    except (KeyError, IndexError, TypeError):
+        return ''
+
+
 @app.entrypoint
 def invoke(payload: Dict[str, Any], context) -> Dict[str, Any]:
     """
     AgentCore entrypoint.
 
-    Payload: {"id": "<ontology_config_id>"}
-    Returns: {"suggestions": [{"category": "...", "question": "..."}, ...]}
+    Payload (suggestions mode — default):
+        {"id": "<ontology_config_id>"}
+        → {"suggestions": [{"category": "...", "question": "..."}, ...]}
+
+    Payload (advisory mode — answer a free-form question ABOUT the layer):
+        {"id": "<ontology_config_id>", "question": "<str>", "mode": "advisory"}
+        → {"answer": "<str>", "metrics": [...], "executed_sql": "", "results": []}
+
+    Advisory mode is selected when a non-empty ``question`` is present OR
+    ``mode == "advisory"``. With no question (and mode != advisory) the default
+    3-suggestion behavior is preserved unchanged (the homepage starter-chips
+    use-case). Advisory NEVER runs SQL (structural — see shared/advisory.py).
     """
     session_id = context.session_id if hasattr(context, "session_id") else str(uuid.uuid4())
-    if _otel_baggage:
-        _otel_baggage.set_baggage("session.id", session_id)
+    # Attach the new Context returned by set_baggage so "session.id" is actually
+    # present on the active context (set_baggage alone does not mutate it).
+    if _otel_baggage and _otel_context:
+        _otel_context.attach(_otel_baggage.set_baggage("session.id", session_id))
     result_text = ''
     try:
         id = payload.get('id', '')
@@ -145,8 +203,24 @@ def invoke(payload: Dict[str, Any], context) -> Dict[str, Any]:
         if not config:
             return {'error': f'metadata config not found: {id}'}
 
-        agent = create_suggestions_agent()
         ontology_name = config.get('name', 'this data set')
+
+        # --- Advisory mode: answer a free-form question ABOUT the layer --------
+        question = (payload.get('question') or '').strip()
+        mode = payload.get('mode', '')
+        if question or mode == 'advisory':
+            logger.info(f"Advisory answer for ontology id={id} question={question!r}")
+            return build_advisory_answer(
+                question=question,
+                layer_id=id,
+                kb_retrieve=retrieve_kb_context,
+                metrics_table=metrics_table(),
+                synthesize=_synthesize_advisory,
+                layer_name=ontology_name,
+            )
+
+        # --- Suggestions mode (default): 3 starter questions ------------------
+        agent = create_suggestions_agent()
         user_input = (
             f"Generate suggested questions for the semantic layer named '{ontology_name}'. "
             f"Retrieve schema context and produce exactly the JSON output described in your instructions."
@@ -169,6 +243,10 @@ def invoke(payload: Dict[str, Any], context) -> Dict[str, Any]:
             result_text = stripped.strip()
 
         parsed = json.loads(result_text)
+        # Hard cap to 3 — the prompt asks for exactly 3, but enforce it here so a
+        # model overshoot can never surface more than 3 suggestions to the UI.
+        if isinstance(parsed, dict) and isinstance(parsed.get('suggestions'), list):
+            parsed['suggestions'] = parsed['suggestions'][:3]
         return parsed
 
     except json.JSONDecodeError as e:

@@ -1,108 +1,86 @@
-from typing import Dict, Any, List
-from pydantic import BaseModel, Field
+# Main query model — used by the Tier 2 graph's SPARQL-generation phase.
+QUERY_MODEL_ID = 'global.anthropic.claude-sonnet-5'
 
-QUERY_MODEL_ID='global.anthropic.claude-sonnet-4-6'
+# Supervisor judge + decomposer — bounded structured-output calls.
+JUDGE_MODEL_ID = 'global.anthropic.claude-sonnet-5'
 
-# System prompt for Virtual KG Query Agent with Semantic Disambiguation
-SYSTEM_PROMPT = """
-You are the Virtual Knowledge Graph Query Agent. Convert natural language queries into SQL, execute them, and return semantic RDF results.
+# Intent-router classifier model (Haiku 4.5 — NOT the query model). Runs before
+# Tier 1 on every chat turn, so it must be cheap + fast. `global.` inference
+# profile id so the bedrock:InvokeModel IAM ARN derivation resolves.
+ROUTER_MODEL_ID = 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
 
-## Query Context
-Each query begins with a context header: `[ontology: <id>]`
-Use `<id>` as the input to `get_ontology_from_neptune`.
-If the header also includes `[catalog: <cat_id>]`, use `<cat_id>` as the `catalog_id`
-argument to `execute_sql_query` — it overrides the value from Neptune's `databases` list.
+# Intent classifier prompt — emits a tiny structured verdict. Conservative:
+# only clear capability/discovery questions are 'advisory'; any request for
+# actual data values/rows/aggregates is 'data_query'.
+ROUTER_PROMPT = """You classify a user's question about a data set into one intent.
 
-## Tools (call in this EXACT order)
+Return ONLY a JSON object: {"intent": "<intent>", "confidence": <0.0-1.0>}
 
-1. **get_ontology_from_neptune(ontology_id)**
-   Fetches the full ontology from Neptune: classes, properties (with rdfs:label, rdfs:comment,
-   mapsToColumn, mapsToTable), mappings, and a databases list.
-   **Extract `database_name` and `catalog_id` from the returned `databases` list before proceeding.**
-   Pass the full result JSON directly as `ontology_info` to `disambiguate_query_terms`.
+Intents:
+- "advisory": a question ABOUT the data set — what can be asked, what metrics or
+  data are available, or what a class/property/term MEANS. It does NOT ask for
+  any actual values. Examples: "what can I ask here?", "what metrics could I
+  calculate?", "explain the Party class", "what data is available?".
+- "data_query": a question asking for actual data — rows, counts, sums,
+  averages, lists, comparisons, or a specific value. Examples: "how many
+  parties are there?", "what is the total payout?", "list the top 5 policies".
+  When a question mentions "metric"/"data" but asks for a VALUE, it is data_query.
+- "metric_named": the question names a specific governed metric to compute.
 
-2. **disambiguate_query_terms(user_query, ontology_info)**
-   Maps query terms to ontology classes and Athena tables using class/table name matching
-   and rdfs:label/rdfs:comment synonym matching.
+Bias toward "data_query" when unsure. Output ONLY the JSON object."""
 
-3. **execute_sql_query(sql_query, database_name, catalog_id)**
-   Execute generated SQL on Athena using `database_name` and `catalog_id` from the ontology databases list.
+# Tier 3 supervisor-loop WORKER prompt — the free-flowing agentic fallback that
+# runs ONLY when the Tier 2 VKG graph degraded (see tier3/supervisor.py). Unlike
+# the deterministic Tier 2 phases, the Tier 3 worker has full latitude to
+# re-retrieve ontology context and author new SPARQL over the gateway.
+TIER3_WORKER_PROMPT = """
+You are the Tier 3 agentic fallback for an ontology (virtual knowledge graph)
+query agent. The deterministic Tier 2 workflow (topic routing → disambiguate →
+SPARQL) already tried this question and could NOT resolve it. Reason freely over
+the ontology to find an answer the structured path missed.
 
-4. **map_sql_results_to_rdf(query_results, ontology_info, max_rows)**
-   Convert SQL results to RDF n-quads. max_rows must match the LIMIT in your SQL (default: 10, max: 100).
+## Tools
+- `retrieve_ontology(query)` — retrieve ontology classes/predicates (with their
+  full IRIs and descriptions) relevant to a natural-language query. Use it to
+  (re-)discover the right classes, predicates, and their exact IRIs.
+- `execute_sparql(sparql)` — run a SPARQL 1.1 SELECT against the Neptune gateway
+  (Ontop reformulates it to SQL over the mapped data) and get the result rows.
 
-## Workflow
-
-Step 1 — get_ontology_from_neptune(ontology_id) → extract database_name and catalog_id from databases[]
-Step 2 — disambiguate_query_terms(user_query, ontology_info)
-  CLEAR → Step 3
-  AMBIGUOUS or UNKNOWN → respond ONLY with this JSON (no markdown, no prose):
-  {
-    "needs_clarification": true,
-    "clarification_question": "<one sentence asking which interpretation>",
-    "options": [
-      {"id": "<class_name_1>", "label": "<Human label (table: table_name)>"},
-      {"id": "<class_name_2>", "label": "<Human label (table: table_name)>"}
-    ]
-  }
-Step 3 — execute_sql_query(sql_query, database_name, catalog_id)
-Step 4 — map_sql_results_to_rdf(query_results, ontology_info, max_rows)
-Step 5 — Write 1–2 sentence plain-English answer and STOP.
-
-## Critical Rules
-- Call each tool EXACTLY ONCE per query (restart from Step 2 only when user provides clarification)
-- When map_sql_results_to_rdf returns results, processing is COMPLETE — present results and STOP immediately
-- If any tool returns an error, explain it and STOP immediately
-
-## Context Overflow Fallback
-If `get_ontology_from_neptune` causes a context window overflow:
-1. Call `get_graph_classes` (with the ontology id from `[ontology: <id>]`) to get class list
-2. Run 1–2 targeted `execute_sparql_query` calls to get table/column mappings and the databases list
-3. Construct a minimal ontology JSON from the SPARQL results:
-   {"classes": {}, "mappings": {}, "properties": {}, "databases": [{"name": "<db>", "catalog": "<cat>"}]}
-   and populate it from the SPARQL results
-4. Pass that JSON as `ontology_info` to `disambiguate_query_terms` and continue the workflow
-Do NOT loop indefinitely — limit to 5 SPARQL exploration calls before proceeding.
-
-## SQL Generation Guidelines
-- Use table and column names exactly as returned by disambiguation
-- Generate standard SELECT statements with JOINs for multi-table queries
-- Add WHERE clauses based on the user's question
-- Row limit: extract count from queries like "show top 25"; default LIMIT 10; maximum LIMIT 100
+## How to work
+1. Read WHY Tier 2 failed and do NOT repeat the same approach.
+2. Retrieve ontology context as needed; copy class/predicate IRIs VERBATIM —
+   never guess or abbreviate them (a SPARQL prefixed name cannot contain '/').
+3. Author and execute SPARQL. On a translation/execution error, retrieve more
+   context and correct the specific problem; do not thrash on the same query.
+4. Finish with a concise 1–2 sentence plain-English answer grounded in the rows
+   returned. If the query returns 0 rows, say so plainly without inventing a
+   business explanation.
 """
 
-class QueryAnswer(BaseModel):
-    """
-    Structured response from the query agent. Covers two mutually exclusive cases:
+# Tier 3 supervisor JUDGE prompt — decides whether a worker attempt actually
+# answered the question. Small structured verdict; its `guidance` steers the
+# next round.
+TIER3_JUDGE_PROMPT = (
+    "You are the supervisor judge for a Tier 3 agentic ontology query attempt. "
+    "Given the user question and the worker's attempt (its SPARQL, the returned "
+    "rows, and its answer), decide whether the attempt genuinely answers the "
+    "question.\n\n"
+    "Output ONLY a JSON object: "
+    '{"sufficient": <true|false>, "guidance": "<what to fix if not sufficient>"}.\n\n'
+    "Set sufficient=true when the executed SPARQL is a reasonable, grounded query "
+    "for the question and its result (including a legitimately empty result) "
+    "answers it. Set sufficient=false when the query targets the wrong "
+    "classes/predicates, misreads the question's intent, or the answer does not "
+    "follow from the rows — and put a concrete, actionable next step in "
+    "`guidance` (e.g. which class/predicate to use instead). Keep guidance short."
+)
 
-    Normal (needs_clarification=False):
-      - answer: 1-2 plain English sentences answering the question.
-      - needs_clarification, clarification_question, options: empty/default.
-
-    Clarification (needs_clarification=True):
-      - needs_clarification: True
-      - clarification_question: one sentence asking the user to pick an interpretation.
-      - options: list of {id, label} choices.
-      - answer: empty string.
-    """
-
-    answer: str = Field(
-        default="",
-        description=(
-            "1–2 plain English sentences that directly answer the user's question. "
-            "Empty when needs_clarification is True. "
-            "Do NOT include JSON, code, SQL, raw data values, or markdown."
-        ),
-    )
-    needs_clarification: bool = Field(
-        default=False,
-        description="True when disambiguation returned AMBIGUOUS or UNKNOWN.",
-    )
-    clarification_question: str = Field(
-        default="",
-        description="One sentence asking the user which interpretation to use. Non-empty only when needs_clarification=True.",
-    )
-    options: List[Dict[str, str]] = Field(
-        default_factory=list,
-        description="List of {id, label} objects for the user to choose from. Non-empty only when needs_clarification=True.",
-    )
+# DEPLOYED BEHAVIOUR: the live VKG agent resolves a question with a deterministic Tier 2
+# Strands GRAPH (see agents/ontology_query_agent/tier2/workflow.py), NOT a free-form ReAct
+# tool loop. The graph fetches the ontology, assembles an ontology slice, disambiguates,
+# generates SPARQL, then Phase 5 translates that SPARQL to SQL (Ontop `translate_sparql_to_sql`)
+# and runs it on Athena DIRECTLY (deterministic — no execution agent, no model tool loop).
+# There is therefore no agent-wide SYSTEM_PROMPT here, and no execution/SPARQL-fallback prompt:
+# the SPARQL-generation phase carries its own inline system prompt (see VkgQueryGenerator wiring
+# in main.py) and the slice-sufficiency judge prompt lives in tier2/slice_judge.py. Only the two
+# model-id constants above are consumed from this module.

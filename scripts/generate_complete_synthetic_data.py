@@ -5,10 +5,8 @@ Generates data for all 12 tables with all columns from data dictionary
 
 import json
 import random  # non-cryptographic randomness — intentional for synthetic data generation
-import uuid
 from datetime import datetime, timedelta
 from faker import Faker
-from decimal import Decimal
 
 fake = Faker()
 
@@ -741,6 +739,159 @@ def generate_coverage_product():
 
 
 # ============================================================================
+# PARTICIPANT / PAYOUT SUB-ENTITIES
+# ============================================================================
+# These ride on the coverages / riders / holdings DynamoDB tables under distinct
+# sk prefixes (LIFEPARTICIPANT# / PARTICIPANT# / PAYOUT#). The Glue normalized-
+# views job demuxes them by `sk LIKE '<PREFIX>#%'` into the life_participant /
+# rider_participant / holding_payout Iceberg tables. Without these rows those
+# normalized tables are EMPTY (the original generator never emitted them), which
+# made participant- and payout-based ground-truth questions unanswerable.
+# Attribute keys are CamelCase like the rest of the generator; Zero-ETL lowercases
+# them so they land as partyid/issueage/... matching the Glue view SELECT lists.
+
+
+def generate_life_participant(holding_id, party_id, seq):
+    """Generate a LIFEPARTICIPANT# row on the coverages table (→ life_participant).
+
+    Args:
+        holding_id: The holding this participant is insured under. Becomes the
+            normalized ``holding_id`` (the view maps ``pk AS holding_id``).
+        party_id: The insured party id (becomes ``party_id``).
+        seq: Per-holding sequence number, kept distinct so a holding can carry
+            more than one participant for the same party (the
+            ``COUNT(DISTINCT participant_sk) > 1`` ground-truth pattern).
+
+    Returns:
+        A DynamoDB item dict with ``pk``/``sk`` and the participant attributes.
+    """
+    participant_id = random_code('LPART', 8)
+    issue_date = random_date(2015, 2024)
+    return {
+        'pk': f"POLICY#{holding_id}",
+        'sk': f"LIFEPARTICIPANT#{participant_id}#{seq}",
+        'PartyID': party_id,
+        'IssueAge': random.randint(18, 75),  # nosec B311
+        'IssueGender': random.choice(['M', 'F']),  # nosec B311
+        'UnderwritingClass': random.choice(  # nosec B311
+            ['Preferred Plus', 'Preferred', 'Standard Plus', 'Standard']),
+        'TobaccoPremiumBasis': random.choice(['Smoker', 'Non-Smoker']),  # nosec B311
+        'CreatedDate': issue_date.strftime('%Y-%m-%d'),
+        'CreatedBy': 'SYSTEM',
+        'UpdatedDate': datetime.now().strftime('%Y-%m-%d'),
+        'UpdatedBy': 'SYSTEM',
+        'Deleted': False,
+    }
+
+
+def generate_rider_participant(holding_id, seq):
+    """Generate a PARTICIPANT# row on the riders table (→ rider_participant).
+
+    Args:
+        holding_id: The holding/policy the rider participant attaches to
+            (becomes the normalized ``holding_id``).
+        seq: Per-rider sequence number for a stable, distinct ``participant_sk``.
+
+    Returns:
+        A DynamoDB item dict with ``pk``/``sk`` and the participant attributes.
+    """
+    participant_id = random_code('RPART', 8)
+    issue_date = random_date(2015, 2024)
+    return {
+        'pk': f"POLICY#{holding_id}",
+        'sk': f"PARTICIPANT#{participant_id}#{seq}",
+        'IssueAge': random.randint(18, 75),  # nosec B311
+        'CreatedDate': issue_date.strftime('%Y-%m-%d'),
+        'CreatedBy': 'SYSTEM',
+        'UpdatedDate': datetime.now().strftime('%Y-%m-%d'),
+        'UpdatedBy': 'SYSTEM',
+        'Deleted': False,
+    }
+
+
+def generate_holding_payout(holding_id, seq):
+    """Generate a PAYOUT# row on the holdings table (→ holding_payout).
+
+    Marks that a holding has a payout schedule; the projected amounts are read
+    from financial_activity by the ground-truth query, so this row only needs to
+    exist with audit fields (matching the holding_payout view's minimal columns).
+
+    Args:
+        holding_id: The holding the payout schedule belongs to.
+        seq: Per-holding sequence number for a distinct ``sk``.
+
+    Returns:
+        A DynamoDB item dict with ``pk``/``sk`` and audit attributes.
+    """
+    payout_id = random_code('PAYOUT', 8)
+    start = random_date(2024, 2025)
+    return {
+        'pk': f"POLICY#{holding_id}",
+        'sk': f"PAYOUT#{payout_id}#{seq}",
+        'CreatedDate': start.strftime('%Y-%m-%d'),
+        'UpdatedDate': datetime.now().strftime('%Y-%m-%d'),
+        'Deleted': False,
+    }
+
+
+def add_participant_payout_rows(all_data):
+    """Append LIFEPARTICIPANT# / PARTICIPANT# / PAYOUT# rows to coverages / riders
+    / holdings in-place, keyed to the EXISTING holdings/riders.
+
+    Shared by the full generator (main) and the append-only top-up script so the
+    sub-entity logic lives in one place. Mutates and returns ``all_data``.
+
+    Args:
+        all_data: dict with at least ``parties``, ``coverages``, ``holdings``,
+            ``riders`` lists of DynamoDB item dicts.
+
+    Returns:
+        The same ``all_data`` dict, with the three sub-entity row sets appended to
+        ``coverages`` / ``riders`` / ``holdings``.
+    """
+    parties = all_data['parties']
+    # life_participant.holding_id = holding.holding_id (both are the pk POLICY#...).
+    holding_pks = sorted({h['pk'] for h in all_data['holdings']
+                          if str(h.get('sk', '')).startswith('HOLDING#')})
+
+    # Life participants: each holding gets 2-3; the FIRST TWO share one party so
+    # COUNT(DISTINCT participant_sk)>1 finds the self-match ("insured is also the
+    # policyholder"); the rest are random insureds.
+    life_participants = []
+    for hi, holding_pk in enumerate(holding_pks):
+        policy_id = holding_pk.split('#', 1)[1]
+        primary_party = parties[hi % len(parties)]['PartyID']
+        for s in range(random.randint(2, 3)):  # nosec B311
+            pid = primary_party if s < 2 else \
+                random.choice(parties)['PartyID']  # nosec B311
+            life_participants.append(
+                generate_life_participant(policy_id, pid, s + 1))
+    all_data['coverages'].extend(life_participants)
+    print(f"   ✓ {len(life_participants)} LIFEPARTICIPANT# rows → coverages")
+
+    # Rider participants: 1-2 per existing rider.
+    rider_participants = []
+    rider_pks = sorted({r['pk'] for r in all_data['riders']
+                        if str(r.get('sk', '')).startswith('RIDER#')})
+    for rider_pk in rider_pks:
+        policy_id = rider_pk.split('#', 1)[1]
+        for s in range(random.randint(1, 2)):  # nosec B311
+            rider_participants.append(
+                generate_rider_participant(policy_id, s + 1))
+    all_data['riders'].extend(rider_participants)
+    print(f"   ✓ {len(rider_participants)} PARTICIPANT# rows → riders")
+
+    # Holding payouts: ~half the holdings carry a payout schedule.
+    holding_payouts = [
+        generate_holding_payout(hp.split('#', 1)[1], 1)
+        for hi, hp in enumerate(holding_pks) if hi % 2 == 0
+    ]
+    all_data['holdings'].extend(holding_payouts)
+    print(f"   ✓ {len(holding_payouts)} PAYOUT# rows → holdings")
+    return all_data
+
+
+# ============================================================================
 # MAIN ORCHESTRATION
 # ============================================================================
 
@@ -841,6 +992,11 @@ def main():
         relation = generate_relation(party_id_1, party_id_2, i + 1)
         all_data['relations'].append(relation)
     print(f"   ✓ Generated {len(all_data['relations'])} relations with 73 columns each")
+
+    # 13-15. Participant / payout sub-entities (LIFEPARTICIPANT# / PARTICIPANT# /
+    # PAYOUT#) are added by add_participant_payout_rows() so a FULL regenerate and
+    # an APPEND-only top-up of an already-loaded dataset share one implementation.
+    add_participant_payout_rows(all_data)
     
     # Save all data to JSON files
     print("\n" + "=" * 80)

@@ -1,6 +1,20 @@
-import axios from 'axios';
+import axios from "axios";
 
-const API_BASE_URL = process.env.REACT_APP_API_URL || '/api';
+const API_BASE_URL = process.env.REACT_APP_API_URL || "/api";
+
+// Base URL of the AgentCore chat Gateway (injected at build time). Streaming
+// chat goes directly through this gateway — it is the only chat transport.
+// Empty only pre-deploy / local dev, where streaming chat is unavailable until
+// the gateway URL is wired.
+const CHAT_GATEWAY_URL = process.env.REACT_APP_CHAT_GATEWAY_URL || "";
+
+// Static map from chat mode to the Gateway target name. Target names are fixed
+// by the CDK chat-gateway definition.
+const CHAT_TARGETS = {
+  "semantic-rag": "metadata-query",
+  vkg: "ontology-query",
+  hybrid: "semantic-layer-query",
+};
 
 // Timeout configurations (in milliseconds)
 const TIMEOUTS = {
@@ -13,7 +27,7 @@ const apiClient = axios.create({
   baseURL: API_BASE_URL,
   timeout: TIMEOUTS.DEFAULT,
   headers: {
-    'Content-Type': 'application/json',
+    "Content-Type": "application/json",
   },
 });
 
@@ -21,7 +35,7 @@ const apiClient = axios.create({
 apiClient.interceptors.request.use(
   (config) => {
     // Add auth token if available
-    const token = localStorage.getItem('authToken');
+    const token = localStorage.getItem("authToken");
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
@@ -29,7 +43,7 @@ apiClient.interceptors.request.use(
   },
   (error) => {
     return Promise.reject(error);
-  }
+  },
 );
 
 // Response interceptor
@@ -42,14 +56,22 @@ apiClient.interceptors.response.use(
     // event so App.js can sign the user out without a direct state reference.
     if (error.response?.status === 401) {
       try {
-        const { fetchAuthSession } = await import('aws-amplify/auth');
+        const { fetchAuthSession } = await import("aws-amplify/auth");
         const session = await fetchAuthSession({ forceRefresh: true });
         const newToken = session?.tokens?.idToken?.toString();
+        // Keep the chat-gateway access token in sync on refresh (see streamChat).
+        const newAccessToken = session?.tokens?.accessToken?.toString();
+        if (newAccessToken) {
+          localStorage.setItem("chatGatewayToken", newAccessToken);
+        }
         if (newToken) {
-          localStorage.setItem('authToken', newToken);
+          localStorage.setItem("authToken", newToken);
           // Retry the original request once with the refreshed token
           const retryConfig = { ...error.config };
-          retryConfig.headers = { ...retryConfig.headers, Authorization: `Bearer ${newToken}` };
+          retryConfig.headers = {
+            ...retryConfig.headers,
+            Authorization: `Bearer ${newToken}`,
+          };
           retryConfig._retried = true; // Prevent infinite retry loop
           if (!error.config._retried) {
             return apiClient(retryConfig);
@@ -58,28 +80,29 @@ apiClient.interceptors.response.use(
       } catch (_refreshErr) {
         // Refresh token also expired — force sign out
       }
-      window.dispatchEvent(new CustomEvent('auth-expired'));
+      window.dispatchEvent(new CustomEvent("auth-expired"));
     }
     // Enhanced error handling
-    if (error.code === 'ECONNABORTED' && error.message.includes('timeout')) {
-      console.error('API Request Timeout:', error.config?.url);
+    if (error.code === "ECONNABORTED" && error.message.includes("timeout")) {
+      console.error("API Request Timeout:", error.config?.url);
       error.isTimeout = true;
       error.userMessage =
-        'Request timed out. The operation is taking longer than expected. Please try again.';
+        "Request timed out. The operation is taking longer than expected. Please try again.";
     } else if (error.response) {
-      console.error('API Error:', error.response.status, error.response.data);
+      console.error("API Error:", error.response.status, error.response.data);
       error.userMessage =
-        error.response.data?.message || 'An error occurred processing your request.';
+        error.response.data?.message ||
+        "An error occurred processing your request.";
     } else if (error.request) {
-      console.error('API No Response:', error.message);
+      console.error("API No Response:", error.message);
       error.userMessage =
-        'Unable to connect to server. Please check your connection.';
+        "Unable to connect to server. Please check your connection.";
     } else {
-      console.error('API Error:', error.message);
-      error.userMessage = 'An unexpected error occurred.';
+      console.error("API Error:", error.message);
+      error.userMessage = "An unexpected error occurred.";
     }
     return Promise.reject(error);
-  }
+  },
 );
 
 // Helper function to handle API responses
@@ -102,7 +125,7 @@ const handleResponse = (promise) => {
 export const ontologyAPI = {
   // Create or update ontology configuration
   createOntologyConfig: async (data) => {
-    return handleResponse(apiClient.post('/ontology/config', data));
+    return handleResponse(apiClient.post("/ontology/config", data));
   },
 
   // Get ontology configuration
@@ -112,15 +135,18 @@ export const ontologyAPI = {
 
   // List all ontologies
   listOntologies: async () => {
-    return handleResponse(apiClient.get('/ontology/list'));
+    return handleResponse(apiClient.get("/ontology/list"));
   },
 
   // Build ontology (trigger generation)
-  buildOntology: async (id) => {
+  // options is forwarded as the POST body. When omitted it defaults to {} so the
+  // backend treats the request as a full build (missing scope => "full").
+  // Pass { scope: "delta", targetTables, removedTables } for a scoped build.
+  buildOntology: async (id, options = {}) => {
     return handleResponse(
-      apiClient.post(`/ontology/build/${id}`, {}, {
+      apiClient.post(`/ontology/build/${id}`, options, {
         timeout: TIMEOUTS.LONG_RUNNING,
-      })
+      }),
     );
   },
 
@@ -142,24 +168,25 @@ export const ontologyAPI = {
   // Submit annotation-driven revision from a base version
   reviseOntology: async (id, baseVersion, annotations) => {
     return handleResponse(
-      apiClient.post(`/ontology/revise/${id}/${baseVersion}`,
+      apiClient.post(
+        `/ontology/revise/${id}/${baseVersion}`,
         { annotations },
-        { timeout: TIMEOUTS.LONG_RUNNING }
-      )
+        { timeout: TIMEOUTS.LONG_RUNNING },
+      ),
     );
   },
 
   // Upload ontology file (markdown)
   uploadOntologyFile: async (file, id) => {
     const formData = new FormData();
-    formData.append('file', file);
-    formData.append('id', id);
+    formData.append("file", file);
+    formData.append("id", id);
 
     return handleResponse(
-      apiClient.post('/ontology/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
+      apiClient.post("/ontology/upload", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
         timeout: TIMEOUTS.UPLOAD,
-      })
+      }),
     );
   },
 
@@ -175,42 +202,50 @@ export const ontologyAPI = {
 export const dataSourceAPI = {
   // List Glue databases
   listGlueDatabases: async () => {
-    return handleResponse(apiClient.get('/datasource/glue/databases'));
+    return handleResponse(apiClient.get("/datasource/glue/databases"));
   },
 
   // List Glue tables in a database
   // catalogId is optional; omit for AWSDataCatalog (e.g. pass 's3tablescatalog/<bucket>' for S3 Tables)
   listGlueTables: async (databaseName, catalogId) => {
-    const params = catalogId ? `?catalogId=${encodeURIComponent(catalogId)}` : '';
-    return handleResponse(apiClient.get(`/datasource/glue/tables/${databaseName}${params}`));
+    const params = catalogId
+      ? `?catalogId=${encodeURIComponent(catalogId)}`
+      : "";
+    return handleResponse(
+      apiClient.get(`/datasource/glue/tables/${databaseName}${params}`),
+    );
   },
 
   // Get table metadata
   getTableMetadata: async (databaseName, tableName, catalogId) => {
-    const params = catalogId ? `?catalogId=${encodeURIComponent(catalogId)}` : '';
+    const params = catalogId
+      ? `?catalogId=${encodeURIComponent(catalogId)}`
+      : "";
     return handleResponse(
-      apiClient.get(`/datasource/glue/metadata/${databaseName}/${tableName}${params}`)
+      apiClient.get(
+        `/datasource/glue/metadata/${databaseName}/${tableName}${params}`,
+      ),
     );
   },
 
   // Extract metadata for selected data sources
   extractMetadata: async (dataSources) => {
     return handleResponse(
-      apiClient.post('/datasource/extract-metadata', { dataSources })
+      apiClient.post("/datasource/extract-metadata", { dataSources }),
     );
   },
 
   // Start Glue crawler
   startCrawler: async (crawlerName) => {
     return handleResponse(
-      apiClient.post(`/datasource/glue/crawler/${crawlerName}/start`)
+      apiClient.post(`/datasource/glue/crawler/${crawlerName}/start`),
     );
   },
 
   // Get crawler status
   getCrawlerStatus: async (crawlerName) => {
     return handleResponse(
-      apiClient.get(`/datasource/glue/crawler/${crawlerName}/status`)
+      apiClient.get(`/datasource/glue/crawler/${crawlerName}/status`),
     );
   },
 };
@@ -219,66 +254,584 @@ export const dataSourceAPI = {
 // QUERY APIs
 // ============================================================================
 export const queryAPI = {
-  // Submit natural language query (returns immediately with queryId; poll for result)
-  submitQuery: async (question, id) => {
-    return handleResponse(
-      apiClient.post('/query/submit', { question, id: id }, {
-        timeout: TIMEOUTS.DEFAULT,
-      })
-    );
-  },
-
-  // Get query result
-  getQueryResult: async (queryId) => {
-    return handleResponse(apiClient.get(`/query/result/${queryId}`));
-  },
-
-  // Get query status
-  getQueryStatus: async (queryId) => {
-    return handleResponse(apiClient.get(`/query/status/${queryId}`));
-  },
-
-  // Poll query until complete
-  pollQueryUntilComplete: async (queryId, maxAttempts = 60, intervalMs = 2000) => {
-    let attempts = 0;
-
-    while (attempts < maxAttempts) {
-      const result = await queryAPI.getQueryStatus(queryId);
-
-      if (!result.success) {
-        return result;
-      }
-
-      const status = result.data.status;
-
-      if (status === 'COMPLETED' || status === 'SUCCEEDED' || status === 'NEEDS_CLARIFICATION') {
-        // Get full result (includes clarification payload when NEEDS_CLARIFICATION)
-        return await queryAPI.getQueryResult(queryId);
-      } else if (status === 'FAILED' || status === 'ERROR' || status === 'BLOCKED') {
-        return {
-          success: false,
-          error: result.data.error || 'Query failed',
-        };
-      }
-
-      // Wait before next poll
-      await new Promise((resolve) => setTimeout(resolve, intervalMs));
-      attempts++;
-    }
-
-    return {
-      success: false,
-      error: 'Query timeout - exceeded maximum wait time',
-    };
-  },
-
   // Get AI-generated suggested questions for a semantic metadata layer.
   // Returns { suggestions: [{ category: string, question: string }] }
   getSuggestedQuestions: async (ontologyId) => {
     return handleResponse(
       apiClient.get(`/query/suggestions/${ontologyId}`, {
         timeout: TIMEOUTS.LONG_RUNNING,
-      })
+      }),
+    );
+  },
+
+  // Submit user feedback (👍/👎 + optional comment) for one assistant turn.
+  // The backend persists this into the per-ontology DynamoDB feedback table,
+  // PII-redacted via Bedrock Guardrails — surfaced in the admin Feedback tab.
+  submitFeedback: async ({
+    sessionId,
+    ontologyId,
+    turnId,
+    rating,
+    comment = "",
+    question = "",
+    answer = "",
+  }) => {
+    return handleResponse(
+      apiClient.post("/query/feedback", {
+        sessionId,
+        ontologyId,
+        turnId,
+        rating,
+        comment,
+        question,
+        answer,
+      }),
+    );
+  },
+
+  // ----------------------------------------------------------------------
+  // AG-UI streaming chat (item #1 — frontend chat)
+  // ----------------------------------------------------------------------
+  //
+  // Uses fetch + ReadableStream rather than EventSource because the latter
+  // doesn't support POST bodies. We parse SSE-formatted chunks ourselves and
+  // invoke `onEvent({type, ...payload})` for each AG-UI event.
+  //
+  // Returns the AbortController so the caller can cancel an in-flight stream
+  // (e.g. when the user clicks "New chat" mid-turn).
+  streamChat: async ({
+    sessionId,
+    ontologyId,
+    mode,
+    message,
+    turnId,
+    onEvent,
+    onError,
+    onClose,
+  }) => {
+    const controller = new AbortController();
+    const target = CHAT_TARGETS[mode] || CHAT_TARGETS["semantic-rag"];
+    // Stream directly through the AgentCore chat Gateway (Cognito bearer JWT) to
+    // bypass the buffered API Gateway/Lambda path (the 30s-timeout + Mangum buffering
+    // that caused HTTP 503). The gateway is the only chat transport; when its URL
+    // isn't configured (local dev before deploy) streaming chat is unavailable.
+    if (!CHAT_GATEWAY_URL) {
+      onError?.(
+        new Error(
+          "Chat gateway URL is not configured (REACT_APP_CHAT_GATEWAY_URL)",
+        ),
+      );
+      return controller;
+    }
+    const url = `${CHAT_GATEWAY_URL.replace(/\/$/, "")}/${target}/invocations`;
+
+    // The gateway's CUSTOM_JWT authorizer matches `allowedClients` against the
+    // token's `client_id` claim, which only the Cognito ACCESS token carries
+    // (the ID token uses `aud`), so the gateway path uses the access token.
+    //
+    // This path uses raw fetch (not the axios apiClient), so the axios response
+    // interceptor's silent token refresh never runs here. Mint the token via
+    // fetchAuthSession() at send time instead of reading the cached
+    // `chatGatewayToken`: Amplify transparently refreshes the access token when
+    // it is near/over its 1h expiry, so a follow-up turn sent after a pause
+    // (e.g. picking a clarification option) carries a valid token rather than a
+    // stale one the gateway would reject with 403.
+    const freshAccessToken = async ({ forceRefresh = false } = {}) => {
+      const { fetchAuthSession } = await import("aws-amplify/auth");
+      const session = await fetchAuthSession({ forceRefresh });
+      const accessToken = session?.tokens?.accessToken?.toString();
+      if (accessToken) {
+        // Keep the cache in sync for any other reader of chatGatewayToken.
+        localStorage.setItem("chatGatewayToken", accessToken);
+      }
+      return accessToken;
+    };
+
+    const sendRequest = (token) => {
+      const headers = {
+        "Content-Type": "application/json",
+        Accept: "text/event-stream",
+      };
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+      return fetch(url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          sessionId,
+          ontologyId,
+          mode,
+          message,
+          turnId,
+        }),
+        signal: controller.signal,
+      });
+    };
+
+    // Fire and forget — caller handles events through callbacks.
+    (async () => {
+      try {
+        let token = await freshAccessToken();
+        let response = await sendRequest(token);
+        // A 401/403 here means the token was rejected at the gateway auth edge
+        // (expired/invalid). Force a refresh and replay the request once before
+        // surfacing the error.
+        if (response.status === 401 || response.status === 403) {
+          token = await freshAccessToken({ forceRefresh: true });
+          response = await sendRequest(token);
+        }
+        if (!response.ok) {
+          throw new Error(`chat request failed: HTTP ${response.status}`);
+        }
+        if (!response.body) {
+          throw new Error("chat response has no body");
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        // SSE records are separated by a blank line. We split on \n\n,
+        // accumulate partials in `buffer`, and parse each completed record.
+        // eslint-disable-next-line no-constant-condition
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let recordEnd = buffer.indexOf("\n\n");
+          while (recordEnd !== -1) {
+            const record = buffer.slice(0, recordEnd);
+            buffer = buffer.slice(recordEnd + 2);
+            const evt = parseSseRecord(record);
+            if (evt && onEvent) {
+              onEvent(evt);
+            }
+            recordEnd = buffer.indexOf("\n\n");
+          }
+        }
+        if (onClose) onClose();
+      } catch (err) {
+        // Aborted streams are not errors from the caller's perspective.
+        if (err.name === "AbortError") {
+          if (onClose) onClose();
+          return;
+        }
+        if (onError) onError(err);
+      }
+    })();
+
+    return controller;
+  },
+};
+
+// Parse a single SSE record (the lines between blank-line separators).
+// Returns the JSON-decoded data payload merged with the event type, or null
+// if the record is malformed.
+function parseSseRecord(record) {
+  if (!record) return null;
+  let eventType = "message";
+  const dataLines = [];
+  for (const line of record.split("\n")) {
+    if (line.startsWith("event: ")) {
+      eventType = line.slice(7).trim();
+    } else if (line.startsWith("data: ")) {
+      dataLines.push(line.slice(6));
+    }
+  }
+  if (dataLines.length === 0) return null;
+  try {
+    const parsed = JSON.parse(dataLines.join("\n"));
+    return { type: eventType, ...parsed };
+  } catch (e) {
+    return null;
+  }
+}
+
+export const chatAPI = {
+  // Restore a session's transcript on page refresh.
+  getSession: async (sessionId) => {
+    return handleResponse(apiClient.get(`/query/sessions/${sessionId}`));
+  },
+
+  // List the caller's recent sessions (chat-first sidebar).
+  // Returns {sessions: [{sessionId, ontologyId, ontologyName, mode, title,
+  // updatedAt, createdAt}], nextCursor}.
+  listSessions: async ({ limit = 50, cursor } = {}) => {
+    const params = { limit };
+    if (cursor) params.cursor = cursor;
+    return handleResponse(apiClient.get(`/query/sessions`, { params }));
+  },
+
+  // Soft-delete a session (sidebar "x" action). Server flips archived=true.
+  deleteSession: async (sessionId) => {
+    return handleResponse(apiClient.delete(`/query/sessions/${sessionId}`));
+  },
+
+  // Soft-delete ALL of the caller's sessions at once (sidebar "Clear all").
+  // Server archives every session owned by the authenticated principal.
+  deleteAllSessions: async () => {
+    return handleResponse(apiClient.delete(`/query/sessions`));
+  },
+};
+
+// ============================================================================
+// FEEDBACK API — per-turn 👍/👎 rows backing the admin "Feedback" tab.
+// ============================================================================
+
+export const feedbackAPI = {
+  // List feedback rows for one ontology (newest-first).
+  list: async (ontologyId, { limit = 50 } = {}) => {
+    return handleResponse(
+      apiClient.get(`/feedback/${encodeURIComponent(ontologyId)}`, {
+        params: { limit },
+      }),
+    );
+  },
+
+  // Delete one feedback row by feedbackId.
+  remove: async (ontologyId, feedbackId) => {
+    return handleResponse(
+      apiClient.delete(
+        `/feedback/${encodeURIComponent(ontologyId)}/${encodeURIComponent(feedbackId)}`,
+      ),
+    );
+  },
+};
+
+// ============================================================================
+// LESSONS-LEARNED API (item #2 — AgentCore Memory long-term records)
+// ============================================================================
+
+export const lessonsAPI = {
+  // List long-term memory records for one ontology. Returns an array of
+  // {memoryRecordId, content, namespaces, createdAt}. Empty when the
+  // backend hasn't been wired with a memory id yet.
+  list: async (ontologyId, { limit = 50 } = {}) => {
+    return handleResponse(
+      apiClient.get(`/lessons/${encodeURIComponent(ontologyId)}`, {
+        params: { limit },
+      }),
+    );
+  },
+
+  // Delete one record. recordId is the memoryRecordId returned by list().
+  remove: async (ontologyId, recordId) => {
+    return handleResponse(
+      apiClient.delete(
+        `/lessons/${encodeURIComponent(ontologyId)}/${encodeURIComponent(recordId)}`,
+      ),
+    );
+  },
+};
+
+// ============================================================================
+// SUPPLEMENTARY DOCUMENTS API (item #3 — creation-time doc pipeline)
+// ============================================================================
+
+export const documentsAPI = {
+  // Upload one supplementary doc (PDF / Markdown / DOCX / text).
+  upload: async (ontologyId, file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return handleResponse(
+      apiClient.post(`/documents/${ontologyId}/upload`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: TIMEOUTS.UPLOAD,
+      }),
+    );
+  },
+
+  // List uploaded docs for one ontology.
+  list: async (ontologyId) => {
+    return handleResponse(apiClient.get(`/documents/${ontologyId}`));
+  },
+
+  // Per-doc status (used by the upload page for progress polling).
+  get: async (ontologyId, docId) => {
+    return handleResponse(apiClient.get(`/documents/${ontologyId}/${docId}`));
+  },
+
+  // Cascade-delete one doc (S3 raw + DDB status row).
+  delete: async (ontologyId, docId) => {
+    return handleResponse(
+      apiClient.delete(`/documents/${ontologyId}/${docId}`),
+    );
+  },
+};
+
+// ============================================================================
+// GROUNDTRUTH DATASET API — per-semantic-layer eval dataset (admin tab).
+// ============================================================================
+//
+// Backs the admin "Ground truth dataset" tab. The dataset is the AgentCore
+// ground-truth evaluation format: a JSON array of records, each with
+// Natural_Language_Question / Expected_Answer / Expected_SQL_Query /
+// Expected_SQL_Result.
+export const groundtruthAPI = {
+  // Upload a dataset JSON file for one semantic layer.
+  upload: async (ontologyId, file) => {
+    const formData = new FormData();
+    formData.append("file", file);
+    return handleResponse(
+      apiClient.post(`/groundtruth/${ontologyId}/upload`, formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+        timeout: TIMEOUTS.UPLOAD,
+      }),
+    );
+  },
+
+  // Fetch the stored dataset (envelope {ontologyId, recordCount, uploadedAt,
+  // records}). Returns recordCount:0 / records:[] when none uploaded yet.
+  get: async (ontologyId) => {
+    return handleResponse(apiClient.get(`/groundtruth/${ontologyId}`));
+  },
+
+  // Delete the stored dataset for one semantic layer.
+  delete: async (ontologyId) => {
+    return handleResponse(apiClient.delete(`/groundtruth/${ontologyId}`));
+  },
+};
+
+// ============================================================================
+// EVALUATIONS API — OnDemand eval-pipeline runs per semantic layer (admin tab).
+// ============================================================================
+//
+// Backs the admin "Evaluations" tab. Runs are produced by the eval-runner
+// triggered when a layer version completes (evaluation.requested event), and
+// capture per-question accuracy / latency / token metrics + a roll-up summary.
+export const evaluationsAPI = {
+  // List run summaries (no per-question rows) for one layer, newest first.
+  listRuns: async (ontologyId) => {
+    return handleResponse(apiClient.get(`/evaluations/${ontologyId}`));
+  },
+
+  // Fetch one full run (incl. per-question metric rows).
+  getRun: async (ontologyId, runId) => {
+    return handleResponse(apiClient.get(`/evaluations/${ontologyId}/${runId}`));
+  },
+
+  // Delete one stored run.
+  deleteRun: async (ontologyId, runId) => {
+    return handleResponse(
+      apiClient.delete(`/evaluations/${ontologyId}/${runId}`),
+    );
+  },
+};
+
+// ============================================================================
+// MONITORING API — per-layer production-signal breakdown (admin tab).
+// ============================================================================
+//
+// Backs the admin "Monitoring" tab. Aggregates LIVE query-agent traffic for one
+// semantic layer into the four resolution layers (metric / semantic / advisory
+// / agentic) plus the share of user turns that used correction language,
+// correlated with the lessons AgentCore Memory has extracted. Read-only; the
+// backend Scans the chat-sessions table (TTL-bounded) filtered by ontologyId.
+export const monitoringAPI = {
+  // Fetch the resolution + correction breakdown envelope for one layer.
+  get: async (ontologyId) => {
+    return handleResponse(
+      apiClient.get(`/monitoring/${encodeURIComponent(ontologyId)}`),
+    );
+  },
+};
+
+// ============================================================================
+// GOVERNED METRICS API — Tier 1 maintained metrics per semantic layer (admin tab).
+// ============================================================================
+//
+// Backs the admin "Governed Metrics" tab. A governed metric is a curated
+// name/description/synonyms + pre-validated compiled_sql row; once PUBLISHED it
+// is embedded (Titan v2) and KNN-matched (cosine ≥ 0.85) against the user's
+// question by the Tier 1 lookup BEFORE the Tier 2 Strands graph runs.
+//
+// Routes are namespace-scoped (`/metrics/namespaces/{ns}/metrics`). The query
+// agents resolve their Tier 1 namespace as `config.namespace || id`, and the
+// ontology config has no `namespace` field — so the effective namespace is
+// always the semantic-layer id. Every call here passes the layer id as `ns`,
+// which guarantees a published metric is discoverable by Tier 1 for that layer.
+//
+// The router mounts only when METRICS_TABLE is set on the REST API Lambda; when
+// it is unset these calls 404 and the tab surfaces an informational empty state.
+export const metricsAPI = {
+  // List every metric (any lifecycle) for one layer.
+  list: async (ns) => {
+    return handleResponse(
+      apiClient.get(`/metrics/namespaces/${encodeURIComponent(ns)}/metrics`),
+    );
+  },
+
+  // Fetch one metric by metric_id.
+  get: async (ns, metricId) => {
+    return handleResponse(
+      apiClient.get(
+        `/metrics/namespaces/${encodeURIComponent(ns)}/metrics/${encodeURIComponent(metricId)}`,
+      ),
+    );
+  },
+
+  // Create a metric. `metric` must carry `namespace === ns` (the backend 400s
+  // on mismatch). SQL is validated SELECT-only with sqlglot server-side.
+  create: async (ns, metric) => {
+    return handleResponse(
+      apiClient.post(
+        `/metrics/namespaces/${encodeURIComponent(ns)}/metrics`,
+        metric,
+      ),
+    );
+  },
+
+  // Replace a metric (bumps version server-side). Identifiers in the body must
+  // match the path (`namespace === ns`, `metric_id === metricId`).
+  update: async (ns, metricId, metric) => {
+    return handleResponse(
+      apiClient.put(
+        `/metrics/namespaces/${encodeURIComponent(ns)}/metrics/${encodeURIComponent(metricId)}`,
+        metric,
+      ),
+    );
+  },
+
+  // Publish a metric — flips lifecycle to PUBLISHED, embeds it, and makes it
+  // live for the Tier 1 lookup. Path uses the gRPC-style `{id}:publish` verb.
+  publish: async (ns, metricId) => {
+    return handleResponse(
+      apiClient.post(
+        `/metrics/namespaces/${encodeURIComponent(ns)}/metrics/${encodeURIComponent(metricId)}:publish`,
+      ),
+    );
+  },
+
+  // Delete a metric (idempotent server-side).
+  remove: async (ns, metricId) => {
+    return handleResponse(
+      apiClient.delete(
+        `/metrics/namespaces/${encodeURIComponent(ns)}/metrics/${encodeURIComponent(metricId)}`,
+      ),
+    );
+  },
+};
+
+// ============================================================================
+// GOVERNED RULES API (enableGovernedRules; VKG and Hybrid layers)
+// ============================================================================
+// A governed rule is business logic a human authored and approved — "a holding
+// unpaid after 90 days is a lapse risk". Rules are RDF in the Neptune named
+// graph `<layerId>/rules`, not DynamoDB rows, but the HTTP surface deliberately
+// mirrors metricsAPI so the admin UI patterns are identical.
+//
+// Applies to any layer type that builds an ontology graph — VKG and Hybrid, not
+// Semantic RAG, which documents tables into a Bedrock KB and mints no IRI for a
+// rule's binding to resolve against. The two surfaces differ: a VKG layer's tab
+// is on ViewKnowledgeGraph, a Hybrid layer's on ViewSemanticRAGMetadata, because
+// that is where AdminDashboard routes each type. See utils/layerCapabilities.js
+// — the applicability check lives there, not here.
+//
+// The router mounts only when BOTH `RULES_ENABLED` and `NEPTUNE_GATEWAY_URL`
+// are set on the REST API Lambda; when either is missing these calls 404 and
+// the tab surfaces an informational empty state. That means a path typo here
+// and a disabled flag look the same from the browser — hence the URL tests.
+export const rulesAPI = {
+  // List every rule (any lifecycle) for one layer.
+  list: async (ns) => {
+    return handleResponse(
+      apiClient.get(`/rules/namespaces/${encodeURIComponent(ns)}/rules`),
+    );
+  },
+
+  // Fetch one rule by rule_id.
+  get: async (ns, ruleId) => {
+    return handleResponse(
+      apiClient.get(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}`,
+      ),
+    );
+  },
+
+  // Create a rule. `rule` must carry `namespace === ns` (the backend 400s on
+  // mismatch). Always lands DRAFT — the server sets the lifecycle, so a client
+  // cannot publish by POSTing lifecycle=PUBLISHED.
+  create: async (ns, rule) => {
+    return handleResponse(
+      apiClient.post(`/rules/namespaces/${encodeURIComponent(ns)}/rules`, rule),
+    );
+  },
+
+  // Import a doc-pipeline mined-rules artefact as DRAFT rules. `key` is the
+  // pipeline's `minedRulesKey` output (`mined-rules/<documentId>.json`).
+  // Nothing arrives approved, attested or compiled — the artefact is a plain
+  // JSON file, so the server re-derives every governed field. Returns
+  // {rules: [...], count: n}; a 404 means that document mined nothing.
+  importMined: async (ns, key) => {
+    return handleResponse(
+      apiClient.post(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules:import`,
+        { key },
+      ),
+    );
+  },
+
+  // Replace a rule. Any edit resets it to DRAFT and drops the compiled SPARQL,
+  // so an edited rule can never execute previously-approved logic.
+  update: async (ns, ruleId, rule) => {
+    return handleResponse(
+      apiClient.put(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}`,
+        rule,
+      ),
+    );
+  },
+
+  // Approve ONE threshold value. This is the human-owned action the compiler
+  // requires — an unapproved threshold is refused at compile time, because a
+  // number nobody signed off on is exactly what makes a rule ungovernable.
+  approveThreshold: async (ns, ruleId, thresholdId, approver) => {
+    return handleResponse(
+      apiClient.post(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}/thresholds/${encodeURIComponent(thresholdId)}:approve`,
+        { approver },
+      ),
+    );
+  },
+
+  // Move a DRAFT rule to APPROVED, recording the reviewer identity.
+  approve: async (ns, ruleId, approver) => {
+    return handleResponse(
+      apiClient.post(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}:approve`,
+        { approver },
+      ),
+    );
+  },
+
+  // Run the four-level validation ladder without publishing. Returns
+  // {reports: [{level, passed, violations}], missing_inputs: [...]}.
+  validate: async (ns, ruleId) => {
+    return handleResponse(
+      apiClient.post(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}:validate`,
+      ),
+    );
+  },
+
+  // Publish. Server-side this validates, compiles, and SMOKE-EXECUTES the
+  // compiled SPARQL through Ontop. A 422 carries the blocking reason verbatim,
+  // so surface `error` to the reviewer rather than a generic failure message.
+  publish: async (ns, ruleId) => {
+    return handleResponse(
+      apiClient.post(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}:publish`,
+      ),
+    );
+  },
+
+  // Delete a rule and all its child nodes from the rules graph.
+  remove: async (ns, ruleId) => {
+    return handleResponse(
+      apiClient.delete(
+        `/rules/namespaces/${encodeURIComponent(ns)}/rules/${encodeURIComponent(ruleId)}`,
+      ),
     );
   },
 };
@@ -292,16 +845,34 @@ export const queryAPI = {
 // The backend reads dataSources (tables + catalogId) from DynamoDB and uses it as the job ID.
 export const startMetadataEnrichment = async (id, options = {}) => {
   return handleResponse(
-    apiClient.post('/metadata/enrich', { id, ...options }, { timeout: TIMEOUTS.LONG_RUNNING })
+    apiClient.post(
+      "/metadata/enrich",
+      { id, ...options },
+      { timeout: TIMEOUTS.LONG_RUNNING },
+    ),
   );
 };
+
+// POST /metadata/delta/{id} — compute (do not run) the Semantic-RAG delta plan.
+// Returns the diff describing which tables need rebuilding vs. can be reused.
+export const computeMetadataDelta = async (id) =>
+  handleResponse(apiClient.post(`/metadata/delta/${id}`));
+
+// POST /ontology/delta/{id} — compute (do not run) the VKG delta plan.
+// Returns the diff describing which tables need rebuilding vs. can be reused.
+export const computeOntologyDelta = async (id) =>
+  handleResponse(apiClient.post(`/ontology/delta/${id}`));
 
 // Start a versioned metadata revision — stamps the active record with revisionMode=True,
 // invokes the metadata agent on the annotation path, and returns {nextVersion}.
 // Call this instead of startMetadataEnrichment when the user submits annotations.
 export const reviseMetadata = async (id, baseVersion, annotations) => {
   return handleResponse(
-    apiClient.post(`/metadata/revise/${id}/${baseVersion}`, { annotations }, { timeout: TIMEOUTS.LONG_RUNNING })
+    apiClient.post(
+      `/metadata/revise/${id}/${baseVersion}`,
+      { annotations },
+      { timeout: TIMEOUTS.LONG_RUNNING },
+    ),
   );
 };
 
@@ -311,23 +882,29 @@ export const getMetadataEnrichmentStatus = async (jobId) => {
 };
 
 // Poll metadata enrichment status until complete
-export const pollMetadataEnrichmentStatus = async (jobId, onProgress, intervalMs = 3000) => {
+export const pollMetadataEnrichmentStatus = async (
+  jobId,
+  onProgress,
+  intervalMs = 3000,
+) => {
   return new Promise((resolve, reject) => {
     const poll = async () => {
       try {
         const result = await getMetadataEnrichmentStatus(jobId);
         if (!result.success) {
-          return reject(new Error(result.error || 'Failed to get enrichment status'));
+          return reject(
+            new Error(result.error || "Failed to get enrichment status"),
+          );
         }
 
         const data = result.data;
         if (onProgress) onProgress(data);
 
-        if (data.status === 'completed') {
+        if (data.status === "completed") {
           return resolve(data);
         }
-        if (data.status === 'failed') {
-          return reject(new Error(data.error || 'Enrichment failed'));
+        if (data.status === "failed") {
+          return reject(new Error(data.error || "Enrichment failed"));
         }
 
         setTimeout(poll, intervalMs);
@@ -339,64 +916,26 @@ export const pollMetadataEnrichmentStatus = async (jobId, onProgress, intervalMs
   });
 };
 
-// Submit natural language query on metadata
-// The backend resolves dataSources (tables + catalogIds) from the ontology config in DynamoDB.
-export const submitMetadataQuery = async (question, id) => {
+// Get AI-enriched metadata for a single table from the Knowledge Base (S3 doc).
+// All four scoping fields are required — the metadata agent writes documents at
+//   metadata/{semantic_layer_id}/{semantic_layer_version}/{catalog_id}/{db}/{table}.md
+export const getTableKBMetadata = async (
+  databaseName,
+  tableName,
+  catalogId,
+  semanticLayerId,
+  semanticLayerVersion,
+) => {
+  const params = new URLSearchParams({
+    catalog_id: catalogId,
+    semantic_layer_id: semanticLayerId,
+    semantic_layer_version: semanticLayerVersion,
+  }).toString();
   return handleResponse(
-    apiClient.post('/metadata/query/submit',
-      { question, id },
-      { timeout: TIMEOUTS.LONG_RUNNING }
-    )
+    apiClient.get(
+      `/metadata/table/${encodeURIComponent(databaseName)}/${encodeURIComponent(tableName)}?${params}`,
+    ),
   );
-};
-
-// Get metadata query status
-export const getMetadataQueryStatus = async (queryId) => {
-  return handleResponse(apiClient.get(`/metadata/query/status/${queryId}`));
-};
-
-// Get metadata query result
-export const getMetadataQueryResult = async (queryId) => {
-  return handleResponse(apiClient.get(`/metadata/query/result/${queryId}`));
-};
-
-// Get AI-enriched metadata for a single table from the Knowledge Base (S3 doc)
-export const getTableKBMetadata = async (databaseName, tableName, catalogId) => {
-  const params = catalogId ? `?catalog_id=${encodeURIComponent(catalogId)}` : '';
-  return handleResponse(apiClient.get(`/metadata/table/${encodeURIComponent(databaseName)}/${encodeURIComponent(tableName)}${params}`));
-};
-
-// Poll metadata query until complete and fetch result
-// maxAttempts * intervalMs = total wait (60 * 3000ms = 3 minutes)
-export const pollMetadataQuery = async (queryId, maxAttempts = 60, intervalMs = 3000) => {
-  let attempts = 0;
-
-  while (attempts < maxAttempts) {
-    const statusResult = await getMetadataQueryStatus(queryId);
-
-    if (!statusResult.success) {
-      return { success: false, error: statusResult.error || 'Failed to get query status' };
-    }
-
-    const { status } = statusResult.data;
-
-    if (status === 'completed') {
-      return await getMetadataQueryResult(queryId);
-    }
-
-    if (status === 'failed' || status === 'blocked') {
-      return { success: false, error: statusResult.data.error || 'Metadata query failed' };
-    }
-
-    if (status === 'NOT_FOUND') {
-      return { success: false, error: 'Query not found — the server may have restarted' };
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-    attempts++;
-  }
-
-  return { success: false, error: 'Query timed out after 3 minutes' };
 };
 
 // ============================================================================
@@ -405,7 +944,7 @@ export const pollMetadataQuery = async (queryId, maxAttempts = 60, intervalMs = 
 export const neptuneAPI = {
   // Execute SPARQL query
   executeSPARQL: async (query) => {
-    return handleResponse(apiClient.post('/neptune/sparql', { query }));
+    return handleResponse(apiClient.post("/neptune/sparql", { query }));
   },
 
   // Get knowledge graph summary
@@ -419,11 +958,15 @@ export const neptuneAPI = {
   },
 
   // Load ontology to Neptune
-  loadOntology: async (s3Path, format = 'turtle') => {
+  loadOntology: async (s3Path, format = "turtle") => {
     return handleResponse(
-      apiClient.post('/neptune/load', { s3Path, format }, {
-        timeout: TIMEOUTS.LONG_RUNNING,
-      })
+      apiClient.post(
+        "/neptune/load",
+        { s3Path, format },
+        {
+          timeout: TIMEOUTS.LONG_RUNNING,
+        },
+      ),
     );
   },
 
@@ -444,23 +987,56 @@ export const neptuneAPI = {
 export const healthAPI = {
   // Check API health
   checkHealth: async () => {
-    return handleResponse(apiClient.get('/health'));
+    return handleResponse(apiClient.get("/health"));
   },
 
   // Get system status
   getSystemStatus: async () => {
-    return handleResponse(apiClient.get('/status'));
+    return handleResponse(apiClient.get("/status"));
+  },
+};
+
+// ============================================================================
+// NAMESPACES & AUTHORIZATION APIs
+// ============================================================================
+export const namespaceAPI = {
+  // List the namespaces the caller may see. The backend filters the result to
+  // the caller's grants, so this is already a permitted view — not everything.
+  list: async () => {
+    return handleResponse(apiClient.get("/namespaces"));
+  },
+
+  // The caller's own resolved roles, plus whether enforcement is switched on.
+  //
+  // Needed because a browser cannot infer its own namespace-scoped roles: the ID
+  // token carries `cognito:groups`, and a group only ever confers a PLATFORM
+  // role. Every namespace-scoped role lives in a grant row only the API can
+  // read. See useAuthz, which seeds from the token and then refines from here.
+  getMyAuthz: async () => {
+    return handleResponse(apiClient.get("/namespaces/me"));
+  },
+
+  // Grants on one namespace. Admin surface — a caller without
+  // grantPermissions gets a 403 rather than an empty list.
+  listGrants: async (namespaceId) => {
+    return handleResponse(
+      apiClient.get(`/namespaces/${encodeURIComponent(namespaceId)}/grants`),
+    );
   },
 };
 
 // Export the configured axios client for custom requests
 export { apiClient };
 
-// Export default object with all APIs
-export default {
+// Export default object with all APIs. Named before exporting so the default
+// has a stable identifier (better stack traces / DevTools display, and
+// satisfies eslint import/no-anonymous-default-export).
+const api = {
   ontologyAPI,
   dataSourceAPI,
   queryAPI,
   neptuneAPI,
   healthAPI,
 };
+
+export default api;

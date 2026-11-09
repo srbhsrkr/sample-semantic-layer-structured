@@ -140,10 +140,17 @@ export class ArmBuildConstruct extends Construct {
           },
           post_build: {
             commands: [
-              'if [ "$SKIP_BUILD" = "false" ]; then echo \'Pushing Docker image to ECR...\'; docker push $ECR_REPO_URI:$IMAGE_TAG; docker push $ECR_REPO_URI:latest; fi',
+              // Push the unique-digest tag — that's the one runtimes pin to.
+              // The `:latest` push is best-effort: ECR repos here are
+              // imageTagMutability=IMMUTABLE, so re-pushing `:latest` after
+              // the first successful build returns "tag invalid" and exits 1.
+              // Failing the whole build for a convenience tag would leave
+              // the runtime pinned to the previous digest. `|| true` lets
+              // the unique-tag push (the one that matters) be the source
+              // of truth for build success.
+              'if [ "$SKIP_BUILD" = "false" ]; then echo \'Pushing Docker image to ECR...\'; docker push $ECR_REPO_URI:$IMAGE_TAG && (docker push $ECR_REPO_URI:latest || echo \'WARN: :latest tag is immutable, skipping\'); fi',
               'echo "Build completed on $(date)"',
               'echo "Image URI: $ECR_REPO_URI:$IMAGE_TAG"',
-              'echo "Also tagged as: $ECR_REPO_URI:latest"',
             ],
           },
         },
@@ -222,6 +229,7 @@ def handler(event, context):
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'index.handler',
       timeout: cdk.Duration.minutes(1),
+      // nosemgrep: missing-template-string-indicator — literal/template string is intentional; no untrusted interpolation
       code: lambda.Code.fromInline(`
 import boto3
 
@@ -331,6 +339,7 @@ def handler(event, context):
     const hash = crypto.createHash('sha256');
 
     const addFileToHash = (filePath: string) => {
+      // nosemgrep: detect-non-literal-fs-filename — CDK build dir / static repo path, not user input
       if (fs.statSync(filePath).isDirectory()) {
         // nosemgrep: detect-non-literal-fs-filename - CDK synth-time file read by app developer
         const files = fs.readdirSync(filePath); // nosemgrep: detect-non-literal-fs-filename — CDK synth-time path set by app developer

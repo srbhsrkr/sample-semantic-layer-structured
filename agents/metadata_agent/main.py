@@ -21,24 +21,37 @@ import sys
 import json
 import logging
 import threading
+import contextvars
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Set, Tuple
 
 import boto3
 from bedrock_agentcore import BedrockAgentCoreApp
 try:
     from opentelemetry import baggage as _otel_baggage
+    from opentelemetry import context as _otel_context
+    from opentelemetry import trace as _otel_trace
 except ImportError:
     _otel_baggage = None  # type: ignore
+    _otel_context = None  # type: ignore
+    _otel_trace = None  # type: ignore
 from strands import Agent, tool
 from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands.hooks import AfterToolCallEvent
 from strands.models import BedrockModel
 from botocore.config import Config
 from boto3.dynamodb.conditions import Key as DKey
 
-from .token_manager import count_tokens
+try:
+    from agents.shared.token_manager import count_tokens
+    # set_boto_session re-exported for notebook/test credential injection.
+    from agents.shared.boto_session import get_boto_session, set_boto_session  # noqa: F401
+except ImportError:
+    from shared.token_manager import count_tokens  # type: ignore
+    from shared.boto_session import get_boto_session, set_boto_session  # type: ignore  # noqa: F401
+from .doc_validator import validate_and_clean
 from .prompt_builder import (
     MODEL_ID,
     SYSTEM_PROMPT,
@@ -46,6 +59,22 @@ from .prompt_builder import (
     build_table_prompt,
     build_annotation_prompt,
 )
+
+# CloudWatch EMF metric emitter lives in the shared package, which the metadata
+# container copies alongside metadata_agent/ (see agents/Dockerfile.metadata).
+# Support both the packaged ('shared') and repo-relative ('agents.shared') paths.
+try:
+    from shared import cw_metrics  # type: ignore
+    from shared.delta_fingerprint import (  # type: ignore
+        schema_hash, make_fingerprint, write_table_fingerprint,
+        iceberg_snapshot_id, ddb_count_marker,
+        is_count_free_catalog, unmeasurable_data_marker)
+except ImportError:  # pragma: no cover - exercised only outside the container
+    from agents.shared import cw_metrics  # type: ignore
+    from agents.shared.delta_fingerprint import (  # type: ignore
+        schema_hash, make_fingerprint, write_table_fingerprint,
+        iceberg_snapshot_id, ddb_count_marker,
+        is_count_free_catalog, unmeasurable_data_marker)
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -66,29 +95,26 @@ logging.getLogger('urllib3').setLevel(logging.WARNING)
 app = BedrockAgentCoreApp(debug=True)
 
 # ---------------------------------------------------------------------------
+# In-layer table inventory (per-invocation, contextvar-scoped)
+# ---------------------------------------------------------------------------
+# The set of bare table names that exist in the semantic layer currently being
+# enriched. Set once per invocation in background_work BEFORE the agent loop, and
+# read by the save_metadata_document_to_s3 tool so the doc validator can drop a
+# ## Reference Tables edge whose target was never materialized in this layer
+# (e.g. an ACORD `participant`/`payout` table the ontology describes but the layer
+# never built). A contextvar — not a module global — so it propagates through the
+# background thread's copied context and stays isolated across concurrent
+# invocations. Empty default = membership check disabled (back-compat / tests).
+_layer_tables_var: contextvars.ContextVar[Set[str]] = contextvars.ContextVar(
+    "metadata_layer_tables", default=frozenset()
+)
+
+
+# ---------------------------------------------------------------------------
 # Boto3 session (injectable for notebooks / tests)
 # ---------------------------------------------------------------------------
-_boto_session: Optional[boto3.Session] = None
-
-
-def set_boto_session(session: boto3.Session) -> None:
-    """Inject a boto3 Session (useful in notebooks and tests)."""
-    global _boto_session
-    _boto_session = session
-    logger.info(f"Boto3 session set with region: {session.region_name}")
-
-
-def get_boto_session() -> boto3.Session:
-    """Return the active boto3 Session, creating a default one if needed."""
-    global _boto_session
-    if _boto_session is None:
-        region = os.environ.get('AWS_REGION')
-        if not region:
-            temp = boto3.Session()
-            region = temp.region_name or 'us-east-1'
-        _boto_session = boto3.Session(region_name=region)
-        logger.info(f"Created default boto3 session with region: {region}")
-    return _boto_session
+# boto3 session management (set_boto_session / get_boto_session) is provided by
+# agents.shared.boto_session, imported above.
 
 
 # ===========================================================================
@@ -168,14 +194,18 @@ def get_single_table_schema(
     Returns:
         JSON string containing table schema details
     """
-    import time
-
     logger.info(
         f"get_single_table_schema called: database='{database_name}', "
         f"table='{table_name}', catalog_id='{catalog_id}'"
     )
     session = get_boto_session()
     athena_error: Optional[Exception] = None
+    # Bound up-front so the terminal `top_error = athena_error or glue_error_val`
+    # cannot hit an unbound name when the Glue fallback SUCCEEDS but returns a
+    # zero-column table (empty StorageDescriptor.Columns) — in that case `if
+    # columns:` is False and control falls through without entering the Glue
+    # `except`. Mirrors ontology_agent.get_single_table_schema.
+    glue_error_val: Optional[Exception] = None
 
     # S3 Tables (Iceberg) catalogs reject `DESCRIBE "db"."table"` with
     # InvalidRequestException — skip Athena entirely and read from Glue directly.
@@ -233,13 +263,28 @@ def get_single_table_schema(
                 )
                 raise RuntimeError(f"DESCRIBE TABLE query {state}: {reason}")
 
-            results = athena.get_query_results(QueryExecutionId=qid)
-            raw_rows = results["ResultSet"]["Rows"]
+            # Athena returns <=1000 rows per page; loop NextToken to fetch the
+            # FULL result set. A wide table (Spider2-scale, >1000 columns) yields
+            # >1000 DESCRIBE rows, and a single call would silently truncate the
+            # schema. Accumulate every page into raw_rows; the downstream [1:]
+            # then skips only the page-1 header row, exactly as before.
+            raw_rows = []
+            next_token = ""
+            while True:
+                page_kwargs: Dict[str, Any] = {"QueryExecutionId": qid}
+                if next_token:
+                    page_kwargs["NextToken"] = next_token
+                page = athena.get_query_results(**page_kwargs)
+                raw_rows.extend(page["ResultSet"]["Rows"])
+                next_token = page.get("NextToken", "") or ""
+                if not next_token:
+                    break
             logger.info(
                 f"Athena query '{qid}' returned {len(raw_rows)} raw rows "
                 f"(including header) for '{database_name}.{table_name}'"
             )
             columns = []
+            _seen_cols: Set[str] = set()
             for row in raw_rows[1:]:  # skip result-set header row
                 data = row.get("Data", [])
                 if len(data) < 2:
@@ -252,6 +297,16 @@ def get_single_table_schema(
                 # DESCRIBE output includes section headers like "# Partition Information"
                 if not col_name or col_name.startswith("#") or col_type == "":
                     continue
+                # Athena DESCRIBE repeats partition columns under the
+                # "# Partition Information" section (they also appear in the main
+                # list). Dedup by name (first occurrence wins) so the column SET
+                # matches what the delta planner hashes via GlueService columns +
+                # partitionKeys — otherwise a partitioned table would hash
+                # differently on each side and read as permanently schemaChanged.
+                _key = col_name.lower()
+                if _key in _seen_cols:
+                    continue
+                _seen_cols.add(_key)
                 columns.append({"name": col_name, "type": col_type, "comment": col_comment})
 
             # Fetch existing table description from Glue (best-effort).
@@ -371,7 +426,7 @@ def get_single_table_schema(
         )
         glue_error_val = glue_error
 
-    top_error = athena_error or glue_error_val  # type: ignore[possibly-undefined]
+    top_error = athena_error or glue_error_val
     return json.dumps(
         {"error": str(top_error), "database_name": database_name, "table_name": table_name}
     )
@@ -479,8 +534,6 @@ def sample_table_data(
     Returns:
         JSON with column names, sample rows, and query metadata
     """
-    import time
-
     session = get_boto_session()
     athena = session.client("athena")
 
@@ -888,8 +941,205 @@ def update_glue_table_metadata(
 
 
 # ===========================================================================
+# Schema-validation helpers (used by save_metadata_document_to_s3)
+# ===========================================================================
+
+def _ddb_query_coordinate(
+    session: boto3.Session,
+    database_name: str,
+    table_name: str,
+    catalog_id: str,
+) -> Optional[Tuple[str, str, str]]:
+    """Return the QUERY-time coordinate for a DynamoDB-connector-backed table.
+
+    A Glue table is served by the Amazon Athena DynamoDB connector when its
+    ``StorageDescriptor.Location`` is a DynamoDB ARN
+    (``arn:aws:dynamodb:<region>:<acct>:table/<NAME>``). For such tables the
+    BUILD/DESCRIBE coordinate (the Glue catalog/db/table — what callers pass here)
+    is NOT the coordinate a SELECT runs against: the connector exposes the data
+    under catalog ``<catalog_id>`` (the connector catalog, e.g. ``dynamodb_catalog``),
+    database ``default`` (the connector's only database), and the table named by the
+    ARN tail (the REAL DynamoDB table name, usually hyphenated). Recording the Glue
+    coordinate in the KB sidecar makes the query agent emit SQL that fails with
+    ``SCHEMA_NOT_FOUND`` (verified: ``raw-vs-normalized`` GoalSuccess 0.0 root cause).
+
+    Args:
+        session: Active boto3 session.
+        database_name: Glue database the table was described from.
+        table_name: Glue table name.
+        catalog_id: The catalog the table was described under. It is NOT reused in the
+            returned coordinate: in practice it is ``AWSDataCatalog``, because the admin
+            data-source picker denylists the connector catalog and surfaces DynamoDB tables
+            through the Glue database ``<project>_dynamodb``. Once the Location is confirmed
+            to be a DynamoDB ARN the connector is the only place the table can be read, so
+            the describe-time catalog is irrelevant and the connector catalog is used instead.
+            Only consulted to decide whether to pass a ``CatalogId`` to ``glue.get_table``.
+
+    Returns:
+        ``(<connector catalog>, "default", <arn_tail>)`` when the table is DynamoDB-backed,
+        where the connector catalog comes from the ``DYNAMODB_CONNECTOR_CATALOG`` env var
+        (default ``dynamodb_catalog``); else ``None`` (so non-DDB tables — S3 Tables, plain
+        Glue — are unchanged).
+
+    Raises:
+        ValueError: when the Location IS a DynamoDB ARN but the ``:table/`` tail
+            cannot be parsed — a wrong coordinate is the exact bug being fixed, so
+            we fail loud rather than silently fall back to the Glue name.
+    """
+    try:
+        glue = session.client("glue")
+        get_kwargs: Dict[str, Any] = {"DatabaseName": database_name, "Name": table_name}
+        if catalog_id and catalog_id not in ("AWSDataCatalog", "AwsDataCatalog"):
+            # The DDB connector catalog is a LAMBDA data catalog, not a Glue
+            # CatalogId; passing it to glue.get_table would 400. The crawler that
+            # registered these tables put them in the standard Glue catalog under
+            # database_name, so describe them there (no CatalogId).
+            get_kwargs.pop("CatalogId", None)
+        tbl = glue.get_table(**get_kwargs)["Table"]
+        location = tbl.get("StorageDescriptor", {}).get("Location", "") or ""
+    except Exception as e:  # noqa: BLE001 — a Glue miss must not block the save
+        logger.warning(
+            "Could not read Glue Location for %s.%s (skip DDB-coordinate "
+            "derivation): %s", database_name, table_name, e,
+        )
+        return None
+
+    # Only a real string Location can be a DDB ARN. A non-str (e.g. a test
+    # MagicMock, or a missing field) is never a DDB-connector table — guard
+    # explicitly so a mock's truthy ``.startswith`` can't mis-trigger derivation.
+    if not isinstance(location, str) or not location.startswith("arn:aws:dynamodb:"):
+        return None  # not a DDB-connector table — leave the coordinate unchanged
+
+    # arn:aws:dynamodb:<region>:<acct>:table/<NAME>  →  <NAME>
+    marker = ":table/"
+    idx = location.find(marker)
+    if idx == -1:
+        raise ValueError(
+            f"DynamoDB Location ARN for {database_name}.{table_name} has no "
+            f"':table/' segment: {location!r} — cannot derive the query coordinate."
+        )
+    ddb_table = location[idx + len(marker):].strip()
+    if not ddb_table:
+        raise ValueError(
+            f"DynamoDB Location ARN for {database_name}.{table_name} has an empty "
+            f"table name: {location!r}."
+        )
+    # Deliberately NOT catalog_id: see the Args note. Echoing the describe-time catalog is the
+    # bug — it records `AWSDataCatalog` + `default` in the sidecar, and the query agent's SQL
+    # then fails `Schema 'default' does not exist`.
+    connector_catalog = os.environ.get("DYNAMODB_CONNECTOR_CATALOG", "dynamodb_catalog")
+    return connector_catalog, "default", ddb_table
+
+
+def _fetch_real_columns(
+    session: boto3.Session,
+    database_name: str,
+    table_name: str,
+    catalog_id: str,
+) -> Set[str]:
+    """Return the authoritative lower-cased column names for a table.
+
+    Calls the existing ``get_single_table_schema`` tool (Athena DESCRIBE with a
+    Glue / S3 Tables fallback) and extracts just the column names, lower-cased so
+    the doc validator can compare case-insensitively.
+
+    This is the single source of truth for "what columns really exist" — the doc
+    validator uses it to drop hallucinated ``## Columns`` rows / join edges.
+
+    Args:
+        session: Active boto3 session (unused directly; the underlying tool reads
+            the module-level session via ``get_boto_session``). Accepted so callers
+            pass it explicitly and the signature documents the dependency.
+        database_name: Glue/Athena database name.
+        table_name: Table name within that database.
+        catalog_id: Catalog identifier (e.g. ``'s3tablescatalog/<bucket>'`` or
+            ``'AWSDataCatalog'``).
+
+    Returns:
+        A set of lower-cased column names, or an empty set when the schema could
+        not be resolved (caller must treat empty as "skip validation", never as
+        "the table has no columns").
+    """
+    try:
+        raw = get_single_table_schema(
+            database_name=database_name,
+            table_name=table_name,
+            catalog_id=catalog_id,
+        )
+        parsed = json.loads(raw)
+    except Exception as e:  # noqa: BLE001 — never block a save on a fetch failure
+        logger.warning(
+            "Could not resolve schema for %s.%s — skipping doc validation: %s",
+            database_name, table_name, e,
+        )
+        return set()
+
+    if not isinstance(parsed, dict) or parsed.get("error"):
+        logger.warning(
+            "Schema fetch returned an error for %s.%s — skipping doc validation: %s",
+            database_name, table_name, parsed.get("error") if isinstance(parsed, dict) else parsed,
+        )
+        return set()
+
+    return {
+        str(col.get("name", "")).lower()
+        for col in parsed.get("columns", [])
+        if col.get("name")
+    }
+
+
+def _resolve_reference_target_columns(
+    session: boto3.Session,
+    database_name: str,
+    catalog_id: str,
+    metadata_content: str,
+) -> Dict[str, Set[str]]:
+    """Resolve real columns for each table named in the doc's Reference Tables.
+
+    Best-effort: fetches the schema of every distinct ``to`` table referenced in
+    the ``## Reference Tables`` section (same database + catalog) so the validator
+    can check the ``to_col`` side of a join edge. Targets whose schema cannot be
+    resolved are simply omitted from the map (the validator then leaves their
+    edges unvalidated rather than guessing).
+
+    Args:
+        session: Active boto3 session, passed through to ``_fetch_real_columns``.
+        database_name: Database the referenced tables are assumed to live in (the
+            metadata_agent authors joins within a single database).
+        catalog_id: Catalog identifier shared by the referenced tables.
+        metadata_content: The markdown document about to be saved.
+
+    Returns:
+        A ``{target_table_lower: {col_lower, ...}}`` map covering only the targets
+        whose schema resolved. May be empty.
+    """
+    # Local import avoids a module-level cycle and keeps the validator package pure.
+    from .doc_validator import extract_reference_edges
+
+    targets = {
+        (edge.get("to") or "").strip()
+        for edge in extract_reference_edges(metadata_content)
+        if (edge.get("to") or "").strip()
+    }
+    resolved: Dict[str, Set[str]] = {}
+    for target in targets:
+        cols = _fetch_real_columns(session, database_name, target, catalog_id)
+        if cols:
+            resolved[target.lower()] = cols
+    return resolved
+
+
+# ===========================================================================
 # TOOL — save_metadata_document_to_s3
 # ===========================================================================
+
+# Bedrock Knowledge Base hard limit on the companion ``.metadata.json`` sidecar.
+# A sidecar over this size is SILENTLY dropped at ingestion (surfaced only as a
+# job-level "Ignored N files as the associated metadata was larger than service
+# limit of MaximumFileSizeSupported: 1024 bytes" failureReason), taking the whole
+# document out of the KB. We keep the sidecar to the five small filter/structural
+# keys so this is never breached for real table/catalog names.
+_KB_METADATA_MAX_BYTES = 1024
 
 @tool
 def save_metadata_document_to_s3(
@@ -897,17 +1147,21 @@ def save_metadata_document_to_s3(
     table_name: str,
     catalog_id: str,
     metadata_content: str,
+    semantic_layer_id: str,
+    semantic_layer_version: str,
 ) -> str:
     """
     Save an enriched metadata document to S3 for Bedrock Knowledge Base ingestion.
 
-    Writes two objects:
-      s3://{ARTIFACTS_BUCKET}/metadata/{database_name}/{table_name}.md
-      s3://{ARTIFACTS_BUCKET}/metadata/{database_name}/{table_name}.md.metadata.json
+    Writes two objects, scoped by semantic-layer id and version so multiple
+    layers (and historical versions) can coexist in the same shared KB:
+      s3://{ARTIFACTS_BUCKET}/metadata/{semantic_layer_id}/{semantic_layer_version}/{catalog_id}/{database_name}/{table_name}.md
+      s3://{ARTIFACTS_BUCKET}/metadata/{semantic_layer_id}/{semantic_layer_version}/{catalog_id}/{database_name}/{table_name}.md.metadata.json
 
-    The companion .metadata.json file makes database_name, catalog_id, and
-    table_name available as Bedrock KB chunk metadata attributes so the query
-    agent can reliably extract them during retrieval.
+    The companion .metadata.json file makes semantic_layer_id,
+    semantic_layer_version, database_name, catalog_id, and table_name
+    available as Bedrock KB chunk metadata attributes so the query agent can
+    filter retrieval to the requested semantic layer + version.
 
     Args:
         database_name: Database the table belongs to.
@@ -916,6 +1170,12 @@ def save_metadata_document_to_s3(
                     's3tablescatalog/<bucket>'). Stored as a KB metadata attribute.
         metadata_content: Markdown document describing the table, its purpose,
                           and each column — produced by the agent.
+        semantic_layer_id: DynamoDB partition key for the metadata config —
+                           identifies which semantic layer this document belongs
+                           to. Required for KB filtering at retrieval time.
+        semantic_layer_version: Version sort-key (e.g. 'v1', 'v2'). Required so
+                                the query agent can scope retrieval to a single
+                                version of the layer.
 
     Returns:
         JSON string with success status and s3_path.
@@ -927,7 +1187,121 @@ def save_metadata_document_to_s3(
     if not bucket:
         return json.dumps({'success': False, 'error': 'ARTIFACTS_BUCKET env var not set'})
 
-    key = f'metadata/{catalog_id}/{database_name}/{table_name}.md'
+    if not semantic_layer_id or not semantic_layer_version:
+        return json.dumps({
+            'success': False,
+            'error': 'semantic_layer_id and semantic_layer_version are required',
+        })
+
+    key = (
+        f'metadata/{semantic_layer_id}/{semantic_layer_version}/'
+        f'{catalog_id}/{database_name}/{table_name}.md'
+    )
+
+    # Source-side schema validation: the LLM composes the ## Columns / ## Reference
+    # Tables sections freely, so a hallucinated column (e.g. holding.party_id when
+    # the real table only has policy_id) or a fabricated join edge can otherwise be
+    # written verbatim to the KB and faithfully copied into the query agent's slice.
+    # Re-fetch the authoritative column set and DROP any column row / join edge that
+    # references a column that does not exist — then save the cleaned doc (self-heal).
+    # A fetch failure yields an empty set, which disables validation rather than
+    # blocking the save: an infra hiccup must never halt the build.
+    real_cols = _fetch_real_columns(session, database_name, table_name, catalog_id)
+    if real_cols:
+        target_cols = _resolve_reference_target_columns(
+            session, database_name, catalog_id, metadata_content,
+        )
+        # Out-of-layer reference drop: any ## Reference Tables edge pointing at a
+        # table not in this layer's inventory is removed (the highest-confidence
+        # fix for the participant/payout redirect that degrades the query agent).
+        # Empty set when the inventory wasn't populated (e.g. annotation mode or a
+        # direct tool call in tests) → membership check is simply skipped.
+        layer_tables = _layer_tables_var.get()
+        metadata_content, dropped = validate_and_clean(
+            md=metadata_content, real_columns=real_cols, target_columns=target_cols,
+            layer_tables=set(layer_tables),
+        )
+        if dropped:
+            logger.warning(
+                "Schema validation dropped %d hallucinated identifier(s) from "
+                "%s.%s before KB save: %s",
+                len(dropped), database_name, table_name, dropped,
+            )
+            cw_metrics.emit(
+                "MetadataDocHallucination", float(len(dropped)),
+                dimensions={"table": f"{database_name}.{table_name}"},
+            )
+
+    # Build the companion metadata sidecar so Bedrock KB surfaces these as chunk
+    # metadata attributes. We persist ONLY the keys the query agent uses:
+    #   - semantic_layer_id / semantic_layer_version → KB retrieval filter
+    #   - database_name / catalog_id / table_name    → Phase 1 candidate id
+    #
+    # IMPORTANT: Bedrock KB enforces a hard 1,024-byte limit on the
+    # .metadata.json sidecar (MaximumFileSizeSupported). When exceeded, the KB
+    # SILENTLY SKIPS the whole document at ingestion (it shows up only as a
+    # job-level "Ignored N files …" failureReason, NOT a per-doc failure), so
+    # wide core-entity tables (party, rider, policy_product, coverage …) never
+    # get indexed and the query agent can't find them. We therefore do NOT write
+    # the bulky derived keys (referenced_tables, column_names, join_keys,
+    # acord_path) here — they are NEVER used as KB filters; the query agent
+    # re-parses them from the markdown body (which is returned in full in each
+    # retrieved chunk — see tier2/markdown_slice_parser.py).
+    #
+    # Validate the sidecar size BEFORE writing anything, so a pathological
+    # identifier fails loudly without orphaning a .md that has no sidecar.
+    # QUERY-time coordinate: for a DynamoDB-connector-backed table the Glue
+    # build/DESCRIBE coordinate (database_name/table_name above) is NOT what a SELECT
+    # runs against — the connector serves the data at catalog/<default>/<real DDB
+    # table name from the Location ARN>. The query agent reads these sidecar attrs
+    # and runs SQL against them, so the sidecar MUST carry the query coordinate or
+    # every query fails SCHEMA_NOT_FOUND. Non-DDB tables return None → unchanged.
+    q_database, q_table, q_catalog = database_name, table_name, (catalog_id or 'AWSDataCatalog')
+    ddb_coord = _ddb_query_coordinate(session, database_name, table_name, catalog_id)
+    if ddb_coord is not None:
+        q_catalog, q_database, q_table = ddb_coord
+        logger.info(
+            "DynamoDB-connector table %s.%s: sidecar query coordinate set to "
+            "catalog=%s database=%s table=%s (Glue coordinate %s.%s kept for storage key)",
+            database_name, table_name, q_catalog, q_database, q_table,
+            database_name, table_name,
+        )
+        # The markdown body the LLM authored references the table by its GLUE name
+        # (the `# header`, the `## Common Query Patterns` example SQL, join `sql`),
+        # and the query agent COPIES that name into FROM. Rewrite the Glue table
+        # name → the connector table name so the doc is consistent with the
+        # corrected sidecar coordinate. The connector name is usually HYPHENATED
+        # (e.g. semantic-layer-dev-parties), which is INVALID as a bare SQL
+        # identifier (Athena: "mismatched input '-'"), so we substitute the
+        # DOUBLE-QUOTED form — valid in every SQL position and harmless in prose.
+        # Whole-token match (word boundaries) so we never touch a longer identifier.
+        if q_table != table_name:
+            quoted = f'"{q_table}"'
+            metadata_content = re.sub(
+                rf'\b{re.escape(table_name)}\b', quoted, metadata_content,
+            )
+
+    attrs: Dict[str, str] = {
+        'semantic_layer_id': semantic_layer_id,
+        'semantic_layer_version': semantic_layer_version,
+        'database_name': q_database,
+        'table_name': q_table,
+        'catalog_id': q_catalog,
+    }
+    sidecar_body = json.dumps({'metadataAttributes': attrs}).encode('utf-8')
+    if len(sidecar_body) > _KB_METADATA_MAX_BYTES:
+        # The five filter/structural keys are tiny, but a pathologically long
+        # table or catalog name could still breach the limit. Fail LOUDLY rather
+        # than let the KB silently drop the doc — a too-long identifier is a real
+        # data problem the operator must see.
+        msg = (
+            f"KB metadata sidecar for {database_name}.{table_name} is "
+            f"{len(sidecar_body)} bytes, over the Bedrock KB limit of "
+            f"{_KB_METADATA_MAX_BYTES}; the document would be silently "
+            f"dropped at ingestion. Shorten the table/catalog identifiers."
+        )
+        logger.error(msg)
+        return json.dumps({'success': False, 'error': msg})
 
     try:
         s3.put_object(
@@ -937,24 +1311,18 @@ def save_metadata_document_to_s3(
             ContentType='text/markdown',
         )
 
-        # Write companion metadata file so Bedrock KB surfaces these as chunk
-        # metadata attributes (database_name, catalog_id, table_name).
-        kb_metadata = {
-            'metadataAttributes': {
-                'database_name': database_name,
-                'table_name': table_name,
-                'catalog_id': catalog_id or 'AWSDataCatalog',
-            }
-        }
         s3.put_object(
             Bucket=bucket,
             Key=f'{key}.metadata.json',
-            Body=json.dumps(kb_metadata).encode('utf-8'),
+            Body=sidecar_body,
             ContentType='application/json',
         )
 
         s3_path = f's3://{bucket}/{key}'
-        logger.info(f"Saved metadata document: {s3_path} (catalog_id={catalog_id})")
+        logger.info(
+            f"Saved metadata document: {s3_path} "
+            f"(layer={semantic_layer_id} version={semantic_layer_version} catalog_id={catalog_id})"
+        )
         return json.dumps({'success': True, 's3_path': s3_path, 'bucket': bucket, 'key': key})
 
     except Exception as e:
@@ -970,6 +1338,78 @@ def _version_num(v: str) -> int:
     """Parse the integer suffix from a version string like 'v1', 'v10'."""
     m = re.search(r'\d+', v or 'v0')
     return int(m.group()) if m else 0
+
+
+def _filter_delta_targets(valid_tables: list, delta_targets) -> list:
+    """Restrict the per-table loop to a delta rebuild set.
+
+    Args:
+        valid_tables: The list of {database, table, catalogId, ...} dicts.
+        delta_targets: A list of 'database.table' names, or None/empty for a full
+            build (returns valid_tables unchanged).
+
+    Returns:
+        The subset of valid_tables whose 'database.table' is in delta_targets, or
+        the full list when delta_targets is falsy. A target with no match is simply
+        skipped (an admin may have deselected a table between plan and build — a
+        loud failure is NOT wanted here).
+    """
+    if not delta_targets:
+        return valid_tables
+    wanted = set(delta_targets)
+    return [t for t in valid_tables
+            if f"{t['database']}.{t['table']}" in wanted]
+
+
+def _data_marker_for_table(db, tbl, cat):
+    """Return (marker, kind) via the SAME shared functions the planner uses.
+
+    Args:
+        db: Database name.
+        tbl: Table name.
+        cat: Catalog id ('s3tablescatalog/<bucket>' or 'AWSDataCatalog').
+
+    Returns:
+        (marker_str, marker_kind) — Iceberg snapshot for S3 Tables, 'unmeasurable' for
+        a federated connector with no aggregation pushdown, else DDB count.
+    """
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    bucket = os.environ.get("ARTIFACTS_BUCKET", "")
+    if str(cat).startswith("s3tablescatalog/"):
+        return iceberg_snapshot_id(db=db, tbl=tbl, catalog_id=cat, region=region), "iceberg_snapshot"
+    # A non-DynamoDB Lambda catalog (e.g. Snowflake) gets no aggregation pushdown, so
+    # the COUNT(*) below would become a full remote scan that outlives its own Lambda.
+    if is_count_free_catalog(catalog_id=str(cat), region=region):
+        return unmeasurable_data_marker(db=db, tbl=tbl, catalog_id=str(cat)), "unmeasurable"
+    return ddb_count_marker(db=db, tbl=tbl, catalog_id=cat, region=region,
+                            artifacts_bucket=bucket), "ddb_count"
+
+
+def _record_table_fingerprint(table, layer_id, version, db, tbl, cat):
+    """Compute + persist this table's fingerprint. Called ONLY on success.
+
+    Args:
+        table: boto3 DynamoDB Table resource for the metadata table.
+        layer_id: The layer/config id.
+        version: The active layer version.
+        db: Database name.
+        tbl: Table name.
+        cat: Catalog id.
+
+    Returns:
+        None.
+    """
+    raw = json.loads(get_single_table_schema(database_name=db, table_name=tbl, catalog_id=cat))
+    # get_single_table_schema ALREADY appends partition keys into `columns`
+    # (metadata_agent/main.py Glue path), so do NOT call merge_columns here — the set
+    # is already in the canonical (data cols + PKs) order the planner reproduces via
+    # merge_columns. Double-merging would duplicate PKs.
+    cols = raw.get("columns", [])
+    marker, kind = _data_marker_for_table(db, tbl, cat)
+    fp = make_fingerprint(schema_h=schema_hash(cols), data_marker=marker,
+                          marker_kind=kind, version=version, catalog_id=cat)
+    write_table_fingerprint(table, layer_id=layer_id, version=version,
+                            db_table=f"{db}.{tbl}", fp=fp)
 
 
 def _resolve_active_version(table, job_id: str) -> str:
@@ -1289,6 +1729,54 @@ def read_document_lines(
 # ===========================================================================
 
 # ===========================================================================
+# OTEL tool-output log hook
+# ===========================================================================
+
+_tool_io_logger = logging.getLogger("strands.tool_io")
+
+
+def _tool_output_log_hook(event: AfterToolCallEvent) -> None:
+    """Emit full tool I/O as a structured OTEL log record to the runtime log group.
+
+    Strands already records tool outputs as attributes on ``gen_ai.choice`` span
+    events in the traces pipeline (``aws/spans``). Those event attributes are
+    subject to ``OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`` / the global attribute length
+    cap — large tool results (e.g. Athena schema responses, KB retrievals) can be
+    truncated before the AgentCore evaluator reads them.
+
+    This hook writes the same data through the OTEL *logs* pipeline
+    (``OTEL_LOGS_EXPORTER=otlp`` is already set on the runtime), which routes to
+    the runtime log group with no per-record size restriction. The current span
+    context (traceId / spanId) is auto-attached by the OTEL log handler, allowing
+    the evaluator to correlate the log record with its matching span.
+    """
+    result = event.result
+    content = result.get("content", []) if result else []
+
+    # Resolve current span context for trace correlation — best-effort.
+    trace_id = ""
+    span_id = ""
+    if _otel_trace is not None:
+        span = _otel_trace.get_current_span()
+        ctx = span.get_span_context() if span else None
+        if ctx and ctx.is_valid:  # nosemgrep: is-function-without-parentheses — is_valid is a @property on SpanContext
+            trace_id = format(ctx.trace_id, "032x")
+            span_id = format(ctx.span_id, "016x")
+
+    _tool_io_logger.info(
+        json.dumps({
+            "event": "tool_result",
+            "tool": event.tool_use.get("name", ""),
+            "tool_use_id": event.tool_use.get("toolUseId", ""),
+            "status": result.get("status", "") if result else "error",
+            "output": content,
+            "trace_id": trace_id,
+            "span_id": span_id,
+        })
+    )
+
+
+# ===========================================================================
 # Agent factory
 # ===========================================================================
 
@@ -1302,7 +1790,11 @@ def create_metadata_agent(system_prompt: str = SYSTEM_PROMPT) -> Agent:
 
     model = BedrockModel(
         model_id=MODEL_ID,
-        temperature=0.2,
+        # NOTE: `temperature` is intentionally omitted — Opus 4.8 deprecated the
+        # parameter and rejects any value with a ValidationException on
+        # ConverseStream ("`temperature` is deprecated for this model"). The
+        # model defaults to deterministic-leaning sampling, which suits the
+        # structured-description task this agent performs.
         max_tokens=16000,
         boto_session=get_boto_session(),
         boto_client_config=boto_config,
@@ -1323,6 +1815,7 @@ def create_metadata_agent(system_prompt: str = SYSTEM_PROMPT) -> Agent:
             read_document_lines,
         ],
         conversation_manager=SlidingWindowConversationManager(window_size=20),
+        hooks=[_tool_output_log_hook],
     )
 
 
@@ -1395,7 +1888,11 @@ def _run_annotation_mode(
     ANNOTATION_SYSTEM_PROMPT for every table and writes a versioned history
     record on completion.
     """
-    target_version = config.get('targetVersion')
+    # Fail loud: a revision run with no target version is a config/programming
+    # error. Silently accepting None would write a None-keyed DynamoDB item (or
+    # emit S3 docs under .../None/...) — mirror ontology_agent._run_revision_mode,
+    # which reads config["targetVersion"] directly.
+    target_version = config['targetVersion']
     valid_tables = [t for t in tables_list if t.get('database') and t.get('table')]
     total = len(valid_tables)
     failures: list = []
@@ -1416,6 +1913,7 @@ def _run_annotation_mode(
                 total_steps=total,
                 job_id=job_id,
                 annotations=annotations,
+                semantic_layer_version=target_version,
             )
             agent(table_prompt)
             processed += 1
@@ -1435,6 +1933,7 @@ def _run_annotation_mode(
         job_id, config, target_version, summary, build_started_at=build_started_at
     )
     _trigger_kb_ingestion()
+    _trigger_eval(job_id, target_version)
 
 
 def _update_dynamodb_status(job_id: str, status: str, version: str = None, **kwargs) -> None:
@@ -1484,6 +1983,27 @@ def _trigger_kb_ingestion() -> None:
         logger.error(f"KB ingestion trigger failed (non-fatal): {e}")
 
 
+def _trigger_eval(job_id: str, version: str) -> None:
+    """Fire-and-forget: request an OnDemand evaluation of this completed
+    SemanticRAG layer version against its maintained ground-truth dataset.
+
+    Emits an ``evaluation.requested`` EventBridge event (see
+    agents/shared/eval_trigger.py). Best-effort — a failure here never affects
+    the just-completed build.
+    """
+    try:
+        try:
+            from agents.shared.eval_trigger import emit_evaluation_requested  # type: ignore
+        except ImportError:
+            from shared.eval_trigger import emit_evaluation_requested  # type: ignore
+        emit_evaluation_requested(
+            ontology_id=job_id, version=version, layer_type="SemanticRAG",
+            boto_session=get_boto_session(),
+        )
+    except Exception as e:  # noqa: BLE001 — non-fatal
+        logger.error(f"[Eval] evaluation.requested emit failed (non-fatal): {e}")
+
+
 # ===========================================================================
 # AgentCore entrypoint
 # ===========================================================================
@@ -1505,8 +2025,12 @@ def invoke(payload, context):
     """
     id = payload.get("id")
     session_id = context.session_id if hasattr(context, "session_id") else str(uuid.uuid4())
-    if _otel_baggage:
-        _otel_baggage.set_baggage("session.id", session_id)
+    # baggage.set_baggage returns a NEW Context — it does not mutate the active one.
+    # Attach it so the "session.id" baggage is actually present on the current context,
+    # which is then captured by contextvars.copy_context() below and carried into the
+    # background thread so AgentCore tags its spans with this runtimeSessionId.
+    if _otel_baggage and _otel_context:
+        _otel_context.attach(_otel_baggage.set_baggage("session.id", session_id))
 
     if not id:
         return {"error": "id required in payload"}
@@ -1581,9 +2105,27 @@ def invoke(payload, context):
 
             # Normal enrichment path — always uses SYSTEM_PROMPT.
             valid_tables = [t for t in tables_list if t.get('database') and t.get('table')]
+            # The in-layer table inventory is the FULL selected set (all databases'
+            # tables), computed BEFORE the delta filter. A delta build rebuilds only a
+            # subset, but a rebuilt table may legitimately reference an UNCHANGED
+            # sibling still in the layer — deriving the inventory from the filtered
+            # subset would make the doc validator strip those valid cross-references.
+            layer_tables = [t['table'] for t in valid_tables]
+            # Now scope the per-table processing loop to the delta rebuild set.
+            delta_targets = config.get("deltaTargetTables")
+            valid_tables = _filter_delta_targets(valid_tables, delta_targets)
             total = len(valid_tables)
             failures: list = []
             processed = 0
+
+            # Threaded into each table prompt so the agent never redirects an
+            # empty/bridge table to a plausible-but-unbuilt ACORD table (e.g.
+            # `participant`/`payout`), which the query agent would then search for,
+            # fail to find, and wrongly report as missing data.
+            # Expose the inventory to save_metadata_document_to_s3 (runs in this
+            # same thread/context) so the doc validator can drop out-of-layer
+            # reference edges as a backstop to the prompt restriction.
+            _layer_tables_var.set(frozenset(layer_tables))
 
             for idx, t in enumerate(valid_tables, 1):
                 db = t['database']
@@ -1599,12 +2141,21 @@ def invoke(payload, context):
                         step=idx,
                         total_steps=total,
                         job_id=id,
+                        semantic_layer_version=active_version,
                         use_cases_description=use_cases_description,
                         data_sources_description=data_sources_description,
                         uploaded_docs=uploaded_docs,
+                        layer_tables=layer_tables,
                     )
                     agent(table_prompt)
                     processed += 1
+                    try:
+                        _record_table_fingerprint(
+                            get_boto_session().resource('dynamodb').Table(
+                                os.environ.get('ONTOLOGY_METADATA_TABLE', 'semantic-layer-metadata')),
+                            id, active_version, db, tbl, cat)
+                    except Exception as fp_err:  # noqa: BLE001 — never fail a build on fingerprinting
+                        logger.warning("fingerprint write failed for %s.%s: %s", db, tbl, fp_err)
                 except Exception as table_err:
                     logger.warning(
                         f"[Table {idx}/{total}] Failed {db}.{tbl}: {table_err} — skipping",
@@ -1626,6 +2177,7 @@ def invoke(payload, context):
                 summary=summary,
             )
             _trigger_kb_ingestion()
+            _trigger_eval(id, active_version)
         except Exception as e:
             logger.error(f"[Background] Enrichment failed for job={id}: {e}", exc_info=True)
             _update_dynamodb_status(
@@ -1638,7 +2190,15 @@ def invoke(payload, context):
             sys.stdout.flush()
             sys.stderr.flush()
 
-    threading.Thread(target=background_work, name='metadata-enrichment', daemon=True).start()
+    # Run background_work inside a copy of the current context so the OTel
+    # "session.id" baggage (attached above) propagates into the thread. Without
+    # this, the thread starts with a fresh context and its spans are untagged —
+    # AgentCore Evaluations would then find no spans for this session.
+    _ctx = contextvars.copy_context()
+    threading.Thread(
+        target=_ctx.run, args=(background_work,),
+        name='metadata-enrichment', daemon=True,
+    ).start()
 
     return {
         'status': 'processing',

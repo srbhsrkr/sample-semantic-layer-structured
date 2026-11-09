@@ -16,9 +16,40 @@ a runtime can't reference its own not-yet-known ARN/ID in its own env vars):
    The SDK's query_runtime_logs_by_traces hardcodes that pattern:
      f"/aws/bedrock-agentcore/runtimes/{agent_id}-DEFAULT"
    so OTLP logs must land there for on-demand evaluation to find them.
+
+AUTHORITATIVE FULL-REPLACE (self-healing): ``update_agent_runtime`` is a
+FULL-REPLACE API — every field the call omits is RESET on the runtime. This handler
+is the SINGLE custom resource that owns that call, so it must re-send the runtime's
+COMPLETE intended state on every invocation or some field gets silently wiped. It
+sources the authoritative state from CFN props (synthesized by CDK) so each deploy
+RESTORES — not merely preserves — that state, healing any prior drift:
+
+  * environmentVariables    ← ``BaseEnvironmentVariables`` prop (CDK source of truth),
+                              then the cloud.resource_id / log-group patches layered on.
+  * authorizerConfiguration ← ``DiscoveryUrl`` + ``AllowedClients`` props
+                              (CUSTOM_JWT). Omitted when not supplied → the runtime
+                              keeps its IAM inbound-auth fallback.
+  * requestHeaderConfiguration ← ``AllowlistedHeaders`` prop, else the live value is
+                              echoed (don't wipe), else omitted.
+  * protocol/lifecycle/metadata/description ← echoed from the live runtime when present.
+
+WHY THIS HANDLER OWNS THE AUTHORIZER: ``AWS::BedrockAgentCore::Runtime`` silently
+drops ``AuthorizerConfiguration`` on CREATE, so the JWT authorizer must be applied
+post-create via the control plane. A code-only container redeploy changes the image
+tag (this resource's fingerprint) WITHOUT changing the authorizer inputs, so the
+authorizer MUST be owned by this same handler: folding it in means a single
+full-replace re-sends EVERYTHING every time and no field can be silently dropped.
+A separate authorizer resource keyed only on allowedClients/headers would stay
+dormant on such a redeploy and leave the authorizer unset. See
+docs/plans/2026-06-04-runtime-authorizer-wipe-design.md.
+
+Bundled with boto3>=1.43.21 (requirements.txt) so the ``authorizerConfiguration`` /
+``requestHeaderConfiguration`` update params are available (the Lambda runtime's
+built-in boto3 predates them).
 """
 
 import logging
+from typing import Any
 
 import boto3
 
@@ -32,6 +63,29 @@ def _replace_kv(csv: str, key: str, value: str) -> str:
     parts = [p for p in csv.split(",") if not p.startswith(prefix)]
     parts.append(f"{prefix}{value}")
     return ",".join(parts)
+
+
+def _build_authorizer(props: dict[str, Any]) -> dict[str, Any] | None:
+    """Build the CUSTOM_JWT authorizerConfiguration from CFN props, or None.
+
+    :param props: the ResourceProperties dict. Reads ``DiscoveryUrl`` (str, the
+        OIDC discovery URL) and ``AllowedClients`` (list[str], allowed JWT client
+        ids). Both must be present and non-empty to build an authorizer.
+    :type props: dict[str, typing.Any]
+    :returns: ``{'customJWTAuthorizer': {'discoveryUrl': ..., 'allowedClients': ...}}``
+        when both inputs are supplied, else ``None`` (runtime keeps IAM inbound auth).
+    :rtype: dict[str, typing.Any] | None
+    """
+    discovery_url = props.get("DiscoveryUrl")
+    allowed_clients = props.get("AllowedClients")
+    if not discovery_url or not allowed_clients:
+        return None
+    return {
+        "customJWTAuthorizer": {
+            "discoveryUrl": discovery_url,
+            "allowedClients": allowed_clients,
+        }
+    }
 
 
 def on_event(event, context):  # noqa: ARG001
@@ -48,8 +102,13 @@ def on_event(event, context):  # noqa: ARG001
     physical_id = f"cloud-resource-id-{runtime_id}"
 
     if request_type == "Delete":
-        # Nothing to undo — leave env vars in place.
-        return {"PhysicalResourceId": physical_id}
+        # Nothing to undo — leave env vars in place. Echo back the EXISTING
+        # physical id CFN sent us rather than recomputing one: on a rollback the
+        # runtime_id (hence the recomputed `cloud-resource-id-{runtime_id}`) can
+        # differ from the physical id CFN assigned on create, and CFN rejects a
+        # Delete that changes the physical id ("cannot change the physical
+        # resource ID during deletion") — which wedges the whole stack rollback.
+        return {"PhysicalResourceId": event.get("PhysicalResourceId", physical_id)}
 
     logs_client = boto3.client("logs", region_name=region)
     client = boto3.client("bedrock-agentcore-control", region_name=region)
@@ -57,7 +116,20 @@ def on_event(event, context):  # noqa: ARG001
     # Get current runtime configuration (required fields for the update call)
     r = client.get_agent_runtime(agentRuntimeId=runtime_id)
 
-    env = dict(r.get("environmentVariables", {}))
+    # AUTHORITATIVE ENV: prefer the CFN-supplied base env block (source of truth
+    # synthesized by CDK). This RESTORES env on every deploy, healing any prior
+    # out-of-band update_agent_runtime that wiped it. Only fall back to the live
+    # runtime env when the property is absent (older stack revisions).
+    base_env = props.get("BaseEnvironmentVariables")
+    if base_env:
+        env = dict(base_env)
+        logger.info("Using CFN-supplied BaseEnvironmentVariables (%d vars)", len(env))
+    else:
+        env = dict(r.get("environmentVariables") or {})
+        logger.info(
+            "BaseEnvironmentVariables absent; falling back to live runtime env (%d vars)",
+            len(env),
+        )
 
     # 1. cloud.resource_id — trailing slash required for CWL Insights glob parse
     cloud_resource_id_value = f"{runtime_arn}/"
@@ -101,13 +173,77 @@ def on_event(event, context):  # noqa: ARG001
     except logs_client.exceptions.ResourceAlreadyExistsException:
         logger.info("Log stream 'runtime-logs' already exists in %s", eval_log_group)
 
-    resp = client.update_agent_runtime(
-        agentRuntimeId=runtime_id,
-        environmentVariables=env,
-        roleArn=r["roleArn"],
-        agentRuntimeArtifact=r["agentRuntimeArtifact"],
-        networkConfiguration=r["networkConfiguration"],
+    # FULL-REPLACE payload: REQUIRED fields + env (restored above). Anything not
+    # included here is reset on the runtime, so build up the complete intended
+    # state before the single update call.
+    #
+    # Strip requireServiceS3Endpoint from the echoed networkConfiguration:
+    # get_agent_runtime returns it, but UpdateAgentRuntime REJECTS it for any
+    # runtime created after 2026-06-11 ("cannot modify requireServiceS3Endpoint")
+    # → the env-var injection fails → the whole agentcore stack rolls back. We
+    # only ever inject env vars here (never touch networking), so dropping this
+    # read-only field is safe and leaves networking unchanged.
+    #
+    # The field is NESTED (e.g. networkConfiguration.vpcConfig / networkModeConfig
+    # carries it, not the top level), and the exact nesting is version-dependent,
+    # so strip it RECURSIVELY wherever it appears rather than popping one known key.
+    def _strip_key(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return {k: _strip_key(v, key) for k, v in obj.items() if k != key}
+        if isinstance(obj, list):
+            return [_strip_key(v, key) for v in obj]
+        return obj
+
+    network_config = _strip_key(
+        dict(r["networkConfiguration"] or {}), "requireServiceS3Endpoint"
     )
+
+    update_kwargs: dict[str, Any] = {
+        "agentRuntimeId": runtime_id,
+        "environmentVariables": env,
+        "roleArn": r["roleArn"],
+        "agentRuntimeArtifact": r["agentRuntimeArtifact"],
+        "networkConfiguration": network_config,
+    }
+
+    # authorizerConfiguration — AUTHORITATIVE from CFN props (CUSTOM_JWT). When the
+    # props are absent (no user pool / IAM-fallback runtime) we omit it; the runtime
+    # keeps its IAM inbound auth. CFN drops AuthorizerConfiguration on CREATE, so
+    # re-sending it here is what actually applies/persists the JWT authorizer.
+    authorizer = _build_authorizer(props)
+    if authorizer:
+        update_kwargs["authorizerConfiguration"] = authorizer
+        logger.info(
+            "Set CUSTOM_JWT authorizer (allowedClients=%s)",
+            props.get("AllowedClients"),
+        )
+
+    # requestHeaderConfiguration — full-replace too. Precedence:
+    #   1. AllowlistedHeaders prop supplied (authoritative, e.g. chat-query runtimes
+    #      forwarding the caller JWT) -> use it.
+    #   2. else the live runtime already has one -> echo it (don't wipe).
+    #   3. else omit.
+    allowlisted_headers = props.get("AllowlistedHeaders")
+    if allowlisted_headers:
+        update_kwargs["requestHeaderConfiguration"] = {
+            "requestHeaderAllowlist": allowlisted_headers
+        }
+    elif r.get("requestHeaderConfiguration"):
+        update_kwargs["requestHeaderConfiguration"] = r["requestHeaderConfiguration"]
+
+    # Other full-replace OPTIONAL fields: echo back whatever the live runtime
+    # carries so the update does not narrow it. These are conditional because
+    # update_agent_runtime rejects empty/None values for fields the runtime lacks.
+    for key in (
+        "protocolConfiguration",
+        "lifecycleConfiguration",
+        "metadataConfiguration",
+        "description",
+    ):
+        if r.get(key):
+            update_kwargs[key] = r[key]
+
+    resp = client.update_agent_runtime(**update_kwargs)
     logger.info("update_agent_runtime status: %s", resp.get("status"))
 
     return {"PhysicalResourceId": physical_id}

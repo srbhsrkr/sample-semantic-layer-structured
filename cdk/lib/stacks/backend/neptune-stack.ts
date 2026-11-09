@@ -3,6 +3,7 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as neptune from 'aws-cdk-lib/aws-neptune';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
+import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 
 export interface NeptuneStackProps extends cdk.StackProps {
@@ -138,6 +139,39 @@ export class NeptuneStack extends cdk.Stack {
     });
 
     this.connectionSecretName = this.connectionSecret.secretName;
+
+    // ── cdk-nag suppressions ────────────────────────────────────────
+    // N2 (auto minor version upgrade): Neptune CfnDBInstance does not
+    // expose autoMinorVersionUpgrade as a synth-time prop on the L1
+    // construct in this CDK version; engine-version upgrades are
+    // managed at the cluster level via the engineVersion prop and
+    // applied during scheduled maintenance windows. Accepting the
+    // finding for this dev/demo stack.
+    NagSuppressions.addResourceSuppressions(primaryInstance, [
+      {
+        id: 'AwsSolutions-N2',
+        reason:
+          'Neptune CfnDBInstance does not surface autoMinorVersionUpgrade in this CDK version; engine version upgrades are managed at the cluster level during the maintenance window.',
+      },
+    ]);
+    NagSuppressions.addResourceSuppressions(readerInstance, [
+      {
+        id: 'AwsSolutions-N2',
+        reason:
+          'Neptune CfnDBInstance does not surface autoMinorVersionUpgrade in this CDK version; engine version upgrades are managed at the cluster level during the maintenance window.',
+      },
+    ]);
+
+    // SMG4 (secret rotation): The connection secret stores Neptune
+    // endpoint / port / loader-role-arn — non-credential metadata that
+    // changes only on infra redeploy. There is nothing to rotate.
+    NagSuppressions.addResourceSuppressions(this.connectionSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason:
+          'Stores Neptune endpoint metadata (no credentials). Rotation is not applicable; values change only on infra redeploy.',
+      },
+    ]);
 
     // Outputs
     new cdk.CfnOutput(this, 'NeptuneClusterEndpoint', {

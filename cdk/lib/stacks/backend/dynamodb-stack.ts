@@ -32,6 +32,19 @@ export class DynamoDBStack extends cdk.Stack {
 
   // Metadata table for semantic ontology tracking
   public readonly metadataTable: dynamodb.Table;
+  public readonly metricsTable: dynamodb.Table;
+
+  // Chat sessions table for AG-UI multi-turn chat (TTL=24h)
+  public readonly chatSessionsTable: dynamodb.Table;
+
+  // Per-turn user feedback (👍/👎 + comment), keyed by ontology so the
+  // admin tab can list/delete per ontology.
+  public readonly feedbackTable: dynamodb.Table;
+
+  // Namespaces as a real primitive: the registry that makes a namespace exist,
+  // and the grants that make it authorizable.
+  public readonly namespacesTable: dynamodb.Table;
+  public readonly grantsTable: dynamodb.Table;
 
   constructor(scope: Construct, id: string, props: DynamoDBStackProps) {
     super(scope, id, props);
@@ -65,23 +78,25 @@ export class DynamoDBStack extends cdk.Stack {
       (table.node.defaultChild as dynamodb.CfnTable).resourcePolicy = {
         policyDocument: {
           Version: '2012-10-17',
-          Statement: [{
-            Sid: 'AllowGlueZeroETL',
-            Effect: 'Allow',
-            Principal: { Service: 'glue.amazonaws.com' },
-            Resource: '*',
-            Action: [
-              'dynamodb:ExportTableToPointInTime',
-              'dynamodb:DescribeTable',
-              'dynamodb:DescribeExport',
-            ],
-            Condition: {
-              StringEquals: { 'aws:SourceAccount': cdk.Aws.ACCOUNT_ID },
-              ArnLike: {
-                'aws:SourceArn': `arn:aws:glue:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:integration:*`,
+          Statement: [
+            {
+              Sid: 'AllowGlueZeroETL',
+              Effect: 'Allow',
+              Principal: { Service: 'glue.amazonaws.com' },
+              Resource: '*',
+              Action: [
+                'dynamodb:ExportTableToPointInTime',
+                'dynamodb:DescribeTable',
+                'dynamodb:DescribeExport',
+              ],
+              Condition: {
+                StringEquals: { 'aws:SourceAccount': cdk.Aws.ACCOUNT_ID },
+                ArnLike: {
+                  'aws:SourceArn': `arn:aws:glue:${cdk.Aws.REGION}:${cdk.Aws.ACCOUNT_ID}:integration:*`,
+                },
               },
             },
-          }],
+          ],
         },
       };
 
@@ -124,6 +139,135 @@ export class DynamoDBStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
+    // Chat sessions for the AG-UI multi-turn chat (item #1).
+    // TTL=24h is enforced by the `ttl` attribute. Items hold the full transcript so a
+    // browser refresh can restore mid-conversation.
+    this.chatSessionsTable = new dynamodb.Table(this, 'ChatSessionsTable', {
+      tableName: `${props.projectName}-chat-sessions`,
+      partitionKey: {
+        name: 'sessionId',
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: false },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: 'ttl',
+    });
+
+    // Governed-metrics table (Tier 1 progressive disclosure).
+    // pk=NS#<namespace>, sk=METRIC#<id> so all metrics in a namespace fetch
+    // in one Query. The lifecycle GSI lets the admin UI list metrics by
+    // status (draft/published/archived) without scanning.
+    this.metricsTable = new dynamodb.Table(this, 'MetricsTable', {
+      tableName: `${props.projectName}-metrics`,
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      // DESTROY (aligned with the sibling metadata/chat-sessions/feedback tables):
+      // RETAIN made this table survive `cdk destroy` and then collide with the
+      // next from-scratch create ("Table already exists"), stranding the whole
+      // deploy at the dynamodb stack (observed 2026-07-28). Metrics are ephemeral
+      // eval telemetry; DESTROY only removes the table on stack DELETE (never on
+      // updates), so repeatable from-scratch destroy/deploy cycles work cleanly.
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+    });
+    this.metricsTable.addGlobalSecondaryIndex({
+      indexName: 'lifecycle-index',
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'lifecycle', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
+    // Per-user chat session list (chat-first redesign 2026-05-24).
+    // Sidebar query: "give me this user's most-recent sessions across all
+    // ontologies." KEYS_ONLY keeps GSI write costs minimal — the list endpoint
+    // hydrates titles/ontology metadata via a follow-up BatchGetItem.
+    this.chatSessionsTable.addGlobalSecondaryIndex({
+      indexName: 'userId-updatedAt-index',
+      partitionKey: { name: 'userId', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'updatedAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.KEYS_ONLY,
+    });
+
+    // Lessons-learned records live in Bedrock AgentCore Memory (managed by
+    // ``agentcore-memory-stack.ts``); there is no ``lessons`` table in this stack.
+
+    // Per-turn user feedback: 👍/👎 + comment for one assistant turn. The
+    // partition key is the ontology so the admin tab can scope listing
+    // without a scan, and the sort key is ``createdAt#feedbackId`` so we
+    // get newest-first ordering with stable ids when timestamps tie.
+    // Comments are PII-redacted by Bedrock Guardrails before write — see
+    // services/feedback_service.py.
+    this.feedbackTable = new dynamodb.Table(this, 'FeedbackTable', {
+      tableName: `${props.projectName}-feedback`,
+      partitionKey: {
+        name: 'ontologyId',
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: {
+        name: 'sk',
+        type: dynamodb.AttributeType.STRING,
+      },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    // Namespace registry (services/namespace_service.py).
+    //   NS#<id>          / METADATA    — the namespace record.
+    //   NS_NAME#<name>   / RESERVATION — the name claim.
+    // Name uniqueness is a conditional write on the reservation item rather than
+    // a GSI: a GSI is eventually consistent, so two concurrent creates could
+    // both read "name free" and both succeed. The reservation carries a `ttl` so
+    // a create that dies between claiming the name and writing the metadata row
+    // releases the name instead of stranding it forever — the successful path
+    // REMOVEs the attribute to make the claim permanent.
+    this.namespacesTable = new dynamodb.Table(this, 'NamespacesTable', {
+      tableName: `${props.projectName}-namespaces`,
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      // DESTROY, matching every sibling table. RETAIN is tempting for
+      // authorization state, but it is what made the metrics table survive a
+      // `cdk destroy` and then collide with the next create (see its comment
+      // above) — and the contents here are re-seeded by the authz bootstrap
+      // custom resource on every deploy, so a from-scratch rebuild recovers the
+      // `default` namespace and the platform-admin grants. Only stack DELETE
+      // removes the table; updates never do.
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      timeToLiveAttribute: 'ttl',
+    });
+
+    // Grants (authz/role_resolver.py + agents/shared/grant_profile.py).
+    //   RES#<resourceId> / <principalKey>#<role>
+    // The base table answers "who has access to this namespace" with one Query;
+    // the PrincipalIndex GSI answers "what can this principal do", which is the
+    // query every authorized request runs. Projection ALL because that read
+    // needs the restriction attributes (tableAllowlist / columnDenylist /
+    // allowedMetrics) too — a KEYS_ONLY index would turn one Query into a Query
+    // plus N BatchGetItems on the hot path of every request.
+    this.grantsTable = new dynamodb.Table(this, 'GrantsTable', {
+      tableName: `${props.projectName}-grants`,
+      partitionKey: { name: 'pk', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      encryption: dynamodb.TableEncryption.AWS_MANAGED,
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      // DESTROY for the same reason as the namespaces table — see above.
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    this.grantsTable.addGlobalSecondaryIndex({
+      indexName: 'PrincipalIndex',
+      partitionKey: { name: 'principalKey', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'sk', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
 
     // Create IAM role for Athena DynamoDB connector
     const athenaConnectorRole = new iam.Role(this, 'AthenaDynamoDBConnectorRole', {
@@ -165,6 +309,9 @@ export class DynamoDBStack extends cdk.Stack {
       { name: 'Riders', table: this.ridersTable },
       { name: 'TypeCodes', table: this.typeCodesTable },
       { name: 'Metadata', table: this.metadataTable },
+      { name: 'ChatSessions', table: this.chatSessionsTable },
+      { name: 'Namespaces', table: this.namespacesTable },
+      { name: 'Grants', table: this.grantsTable },
     ];
 
     outputTables.forEach(({ name, table }) => {
@@ -195,14 +342,34 @@ export class DynamoDBStack extends cdk.Stack {
       const datasetMappings = [
         { table: this.typeCodesTable, filename: 'type_codes.json', displayName: 'Type Codes' },
         { table: this.adminCodesTable, filename: 'admin_codes.json', displayName: 'Admin Codes' },
-        { table: this.policyProductsTable, filename: 'policy_products.json', displayName: 'Policy Products' },
-        { table: this.coverageProductsTable, filename: 'coverage_products.json', displayName: 'Coverage Products' },
-        { table: this.investProductsTable, filename: 'invest_products.json', displayName: 'Investment Products' },
+        {
+          table: this.policyProductsTable,
+          filename: 'policy_products.json',
+          displayName: 'Policy Products',
+        },
+        {
+          table: this.coverageProductsTable,
+          filename: 'coverage_products.json',
+          displayName: 'Coverage Products',
+        },
+        {
+          table: this.investProductsTable,
+          filename: 'invest_products.json',
+          displayName: 'Investment Products',
+        },
         { table: this.partiesTable, filename: 'parties.json', displayName: 'Parties' },
         { table: this.coveragesTable, filename: 'coverages.json', displayName: 'Coverages' },
         { table: this.holdingsTable, filename: 'holdings.json', displayName: 'Holdings' },
-        { table: this.financialActivitiesTable, filename: 'financial_activities.json', displayName: 'Financial Activities' },
-        { table: this.financialStatementsTable, filename: 'financial_statements.json', displayName: 'Financial Statements' },
+        {
+          table: this.financialActivitiesTable,
+          filename: 'financial_activities.json',
+          displayName: 'Financial Activities',
+        },
+        {
+          table: this.financialStatementsTable,
+          filename: 'financial_statements.json',
+          displayName: 'Financial Statements',
+        },
         { table: this.ridersTable, filename: 'riders.json', displayName: 'Riders' },
         { table: this.relationsTable, filename: 'relations.json', displayName: 'Relations' },
       ];
@@ -219,13 +386,13 @@ export class DynamoDBStack extends cdk.Stack {
 
       cdk.Annotations.of(this).addInfo(
         'Synthetic data will be loaded automatically during deployment into separate tables. ' +
-        'This may take 10-15 minutes for ~11MB of data across 12 tables.'
+          'This may take 10-15 minutes for ~11MB of data across 12 tables.'
       );
     } else {
       cdk.Annotations.of(this).addWarning(
         'Synthetic data loading is disabled. ' +
-        'Run scripts/load_to_dynamodb.py manually to load data, or ' +
-        `enable by setting loadSyntheticData: true in the stack props.`
+          'Run scripts/load_to_dynamodb.py manually to load data, or ' +
+          `enable by setting loadSyntheticData: true in the stack props.`
       );
     }
   }

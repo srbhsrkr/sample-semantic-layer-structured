@@ -26,6 +26,7 @@ export class NeptuneLoaderTrigger extends Construct {
     const loaderFunction = new lambda.Function(this, 'LoaderFunction', {
       runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'index.handler',
+      // nosemgrep: missing-template-string-indicator — literal/template string is intentional; no untrusted interpolation
       code: lambda.Code.fromInline(`
 import json
 import urllib3

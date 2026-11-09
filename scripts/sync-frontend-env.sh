@@ -56,7 +56,7 @@ fi
 # Backup existing .env
 BACKUP_FILE="$FRONTEND_ENV.backup-$(date +%Y%m%d-%H%M%S)"
 cp "$FRONTEND_ENV" "$BACKUP_FILE"
-echo "💾 Backed up existing .env to: $(basename $BACKUP_FILE)"
+echo "💾 Backed up existing .env to: $(basename $BACKUP_FILE)"  # nosemgrep: unquoted-variable-expansion-in-command — local dev setup script; operator-provided values
 
 # Update .env file
 echo "✏️  Updating frontend/.env..."

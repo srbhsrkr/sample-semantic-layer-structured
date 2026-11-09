@@ -68,49 +68,6 @@ def test_get_enrichment_status_reads_correct_key():
         assert result['progressPercent'] == 40
 
 
-def test_submit_metadata_query_returns_query_id():
-    """Test that submit_metadata_query returns a query ID with processing status"""
-    from unittest.mock import MagicMock, patch
-
-    with patch('services.metadata_service.boto3') as mock_boto, \
-         patch('services.metadata_service.AgentCoreService') as mock_ac:
-        mock_ac_inst = MagicMock()
-        mock_ac.return_value = mock_ac_inst
-
-        mock_table = MagicMock()
-        test_id = 'test-id-xxxx-1234-5678-abcd'
-        mock_table.query.return_value = {'Items': [{
-            'id': test_id, 'version': 'v1',
-            'dataSources': [{'databaseName': 'mydb', 'tableName': 'orders', 'catalogId': 'AWSDataCatalog'}],
-        }]}
-        mock_boto.resource.return_value.Table.return_value = mock_table
-
-        from services.metadata_service import MetadataService
-        svc = MetadataService()
-        result = svc.submit_metadata_query(question='How many policies?', id=test_id)
-        assert result['status'] == 'processing'
-        assert 'queryId' in result
-        assert result['question'] == 'How many policies?'
-
-
-def test_get_metadata_query_result_returns_parsed_response():
-    """Test that get_metadata_query_result returns not_found when query does not exist"""
-    from unittest.mock import MagicMock, patch
-
-    with patch('services.metadata_service.boto3') as mock_boto, \
-         patch('services.metadata_service.AgentCoreService'):
-        mock_table = MagicMock()
-        # Mock the query table to return empty items (not found)
-        mock_table.get_item.return_value = {}
-        mock_boto.resource.return_value.Table.return_value = mock_table
-
-        from services.metadata_service import MetadataService
-        svc = MetadataService()
-        result = svc.get_metadata_query_result('qid-1')
-        assert result['status'] == 'not_found'
-        assert result['queryId'] == 'qid-1'
-
-
 def test_start_enrichment_passes_annotations_to_agentcore():
     """Annotations are stored in DynamoDB and invoke_metadata_agent is called with job_id only."""
     from unittest.mock import MagicMock, patch
@@ -272,3 +229,42 @@ def test_start_metadata_revision_stamps_active_version_and_invokes_agent():
     # return shape
     assert result['status'] == 'building'
     assert result['nextVersion'] == 'v3'
+
+
+def test_parse_metadata_markdown_extracts_all_sections():
+    """_parse_metadata_markdown must return EVERY ## section (not just Overview
+    + Columns) so the Metadata tab can render the full curated KB document."""
+    from unittest.mock import patch, MagicMock
+    with patch('services.metadata_service.boto3'), \
+         patch('services.metadata_service.AgentCoreService'):
+        from services.metadata_service import MetadataService
+        svc = MetadataService()
+
+    md = (
+        "# cat.db.address\n\n"
+        "## Overview\nPostal address of a party.\n\n"
+        "## Business Purpose\nLocate where a customer lives.\n\n"
+        "## Reference Tables\n- `party`: JOIN party p ON address.party_id = p.party_id\n\n"
+        "## Columns\n"
+        "| Column | Type | Description |\n"
+        "|--------|------|-------------|\n"
+        "| party_id | string | FK to party. |\n"
+        "| city | string | City of the address. |\n\n"
+        "## Notes\nAudit-only soft delete.\n"
+    )
+    parsed = svc._parse_metadata_markdown(md)
+
+    # Overview still drives the short description; columns still parse.
+    assert parsed['description'] == 'Postal address of a party.'
+    assert [c['name'] for c in parsed['columns']] == ['party_id', 'city']
+    assert parsed['columns'][0]['description'] == 'FK to party.'
+
+    # NEW: every section is captured in document order for full-doc rendering.
+    titles = [s['title'] for s in parsed['sections']]
+    assert titles == [
+        'Overview', 'Business Purpose', 'Reference Tables', 'Columns', 'Notes',
+    ]
+    bp = next(s for s in parsed['sections'] if s['title'] == 'Business Purpose')
+    assert bp['body'] == 'Locate where a customer lives.'
+    ref = next(s for s in parsed['sections'] if s['title'] == 'Reference Tables')
+    assert 'JOIN party p' in ref['body']

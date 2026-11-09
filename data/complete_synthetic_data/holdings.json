@@ -8644,7 +8644,7 @@
     "sk": "LOAN#LOAN00000001",
     "HoldingID": "HOLD00955988",
     "PolicyID": "POL00000001",
-    "InterestRate": 0.045000,
+    "InterestRate": 0.045,
     "CreatedDate": "2023-03-15",
     "UpdatedDate": "2026-03-01",
     "Deleted": false
@@ -8654,7 +8654,7 @@
     "sk": "LOAN#LOAN00000002",
     "HoldingID": "HOLD00738825",
     "PolicyID": "POL00000002",
-    "InterestRate": 0.038500,
+    "InterestRate": 0.0385,
     "CreatedDate": "2023-05-10",
     "UpdatedDate": "2026-03-01",
     "Deleted": false
@@ -8664,7 +8664,7 @@
     "sk": "LOAN#LOAN00000003",
     "HoldingID": "HOLD13646924",
     "PolicyID": "POL00000003",
-    "InterestRate": 0.052000,
+    "InterestRate": 0.052,
     "CreatedDate": "2022-11-20",
     "UpdatedDate": "2026-03-01",
     "Deleted": false
@@ -8679,7 +8679,7 @@
     "UnitValue": 42.75,
     "NumberOfUnits": 500,
     "AllocationPercent": 40.0,
-    "CurrentValue": 21375.00,
+    "CurrentValue": 21375.0,
     "CreatedDate": "2023-03-15",
     "UpdatedDate": "2026-03-01",
     "Deleted": false
@@ -8691,10 +8691,10 @@
     "PolicyID": "POL00000001",
     "FundCode": "FUND002FIX",
     "FundName": "Fixed Income Bond Fund",
-    "UnitValue": 18.30,
+    "UnitValue": 18.3,
     "NumberOfUnits": 1200,
     "AllocationPercent": 35.0,
-    "CurrentValue": 21960.00,
+    "CurrentValue": 21960.0,
     "CreatedDate": "2023-03-15",
     "UpdatedDate": "2026-03-01",
     "Deleted": false
@@ -8706,12 +8706,82 @@
     "PolicyID": "POL00000002",
     "FundCode": "FUND003BAL",
     "FundName": "Balanced Growth Fund",
-    "UnitValue": 31.50,
+    "UnitValue": 31.5,
     "NumberOfUnits": 800,
     "AllocationPercent": 50.0,
-    "CurrentValue": 25200.00,
+    "CurrentValue": 25200.0,
     "CreatedDate": "2023-05-10",
     "UpdatedDate": "2026-03-01",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000001",
+    "sk": "PAYOUT#PAYOUT09732882#1",
+    "CreatedDate": "2025-02-10",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000003",
+    "sk": "PAYOUT#PAYOUT64294270#1",
+    "CreatedDate": "2024-06-24",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000005",
+    "sk": "PAYOUT#PAYOUT93928056#1",
+    "CreatedDate": "2024-05-24",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000007",
+    "sk": "PAYOUT#PAYOUT18460563#1",
+    "CreatedDate": "2025-06-17",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000009",
+    "sk": "PAYOUT#PAYOUT14842480#1",
+    "CreatedDate": "2024-01-24",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000011",
+    "sk": "PAYOUT#PAYOUT37450566#1",
+    "CreatedDate": "2024-08-21",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000013",
+    "sk": "PAYOUT#PAYOUT97274699#1",
+    "CreatedDate": "2025-01-14",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000015",
+    "sk": "PAYOUT#PAYOUT07318141#1",
+    "CreatedDate": "2024-11-20",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000017",
+    "sk": "PAYOUT#PAYOUT56757059#1",
+    "CreatedDate": "2025-02-04",
+    "UpdatedDate": "2026-06-12",
+    "Deleted": false
+  },
+  {
+    "pk": "POLICY#POL00000019",
+    "sk": "PAYOUT#PAYOUT14901017#1",
+    "CreatedDate": "2024-04-20",
+    "UpdatedDate": "2026-06-12",
     "Deleted": false
   }
 ]

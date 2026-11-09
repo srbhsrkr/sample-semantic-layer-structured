@@ -18,6 +18,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy agent code
 COPY metadata_agent/ ./metadata_agent/
+# Shared modules (AGUIEmitter, streaming_runner, memory_hooks, guardrail_*).
+COPY shared/ ./shared/
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

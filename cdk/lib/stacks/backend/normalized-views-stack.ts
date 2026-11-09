@@ -3,12 +3,14 @@ import * as cr from 'aws-cdk-lib/custom-resources';
 import * as glue from 'aws-cdk-lib/aws-glue';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lakeformation from 'aws-cdk-lib/aws-lakeformation';
+import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as s3deploy from 'aws-cdk-lib/aws-s3-deployment';
 import * as path from 'path';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
+import { LfAdminRegistration } from '../../common/constructs/lf-admin-registration';
 import { DataLakeStack } from './data-lake-stack';
 import { ZeroEtlStack } from './zeroetl';
 
@@ -143,41 +145,131 @@ export class NormalizedViewsStack extends cdk.Stack {
       ]),
     });
 
-    // ── Lake Formation grants on source zetl_* namespaces ───────────────────
-    // All known zetl_* namespaces — each Zero-ETL redeployment creates new UUIDs.
-    // LF grants must cover every namespace the Glue job may read from (job picks newest).
-    // Add new entries here after redeployments; old entries are harmless.
-    const ZETL_NAMESPACES: string[] = [
-      // Batch 4 (redeploy 2026-04-01, semantic-layer-dev)
-      'zetl_0fcf456c_5821_4739_b594_32fb42d80a73',
-      'zetl_14335b80_396f_4c30_913c_444902e5cb10',
-      'zetl_16c76f57_3905_45da_93ed_3c1d4b72f196',
-      'zetl_351f3256_dff1_4045_9238_5ec8abcbf944',
-      'zetl_7698428a_bd2b_4dc4_90c6_ac47ce2d5871',
-      'zetl_8ee52339_f1e1_4d73_99f1_06e79c97b2bd',
-      'zetl_946f6685_d7c2_400f_a145_08f37153b24e',
-      'zetl_b5a644dd_474a_4b13_bd3a_358d99d4dc9f',
-      'zetl_cc86f78a_2d5a_4643_811f_6c6262cf28a4',
-      'zetl_e3a58232_3570_4de4_a16b_3410c53b2f2c',
-      'zetl_ebdc9373_f923_48e7_af6a_929ecca1a237',
-      'zetl_f644c442_482d_440f_a282_b1e5d4de25d9',
-    ];
-
+    // ── Lake Formation grants on source zetl_* namespaces (DYNAMIC) ──────────
+    // Each Zero-ETL redeployment creates a NEW zetl_<uuid> namespace, and the
+    // Glue MV job reads from the NEWEST one per source table. A hardcoded list
+    // of namespace ids (the previous approach) inevitably goes stale: the next
+    // redeploy's namespace is never in the list, so the MV job hits
+    // "Principal does not have any privilege" and fails (observed 2026-06-12).
+    //
+    // Instead, discover every current zetl_* namespace at DEPLOY time and grant
+    // the job role SELECT/DESCRIBE on each. Re-runs on every deploy (poll
+    // counter in physicalResourceId) so a fresh Zero-ETL namespace is always
+    // covered without editing this file.
     const s3tCatalogId = `${this.account}:s3tablescatalog/${bucketName}`;
 
-    ZETL_NAMESPACES.forEach((zetlNs, i) => {
-      new lakeformation.CfnPermissions(this, `LFSourceGrant${i}`, {
-        dataLakePrincipal: { dataLakePrincipalIdentifier: jobRole.roleArn },
-        resource: {
-          tableResource: {
-            catalogId: s3tCatalogId,
-            databaseName: zetlNs,
-            tableWildcard: {},
-          },
-        },
-        permissions: ['SELECT'],
-      });
+    // Provider-backed custom resource: at every deploy, discover every current
+    // zetl_* namespace and grant the MV job role SELECT/DESCRIBE on each table.
+    // This replaces a hardcoded namespace list that went stale on each Zero-ETL
+    // redeploy (the newest namespace was never granted → MV job "Principal does
+    // not have any privilege"). The Lambda just does the work and returns; the
+    // cr.Provider handles the CloudFormation response protocol.
+    const grantZetlLfFn = new lambda.Function(this, 'GrantZetlLfFn', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.handler',
+      timeout: cdk.Duration.minutes(5),
+      code: lambda.Code.fromInline(
+        [
+          'import time',
+          'import boto3',
+          '',
+          '# The LF admin registration this resource depends on completes seconds before',
+          '# this handler runs, and the first grant can still see the pre-registration',
+          '# state. Retry AccessDenied with backoff for ~2 min before declaring failure.',
+          'RETRY_BUDGET_S = 120',
+          '',
+          'def _grant(lf, role_arn, catalog_id, ns, name):',
+          '    deadline = time.time() + RETRY_BUDGET_S',
+          '    delay = 5',
+          '    while True:',
+          '        try:',
+          '            lf.grant_permissions(',
+          '                Principal={"DataLakePrincipalIdentifier": role_arn},',
+          '                Resource={"Table": {"CatalogId": catalog_id, "DatabaseName": ns, "Name": name}},',
+          '                Permissions=["SELECT", "DESCRIBE"])',
+          '            return',
+          '        except lf.exceptions.AccessDeniedException:',
+          '            if time.time() + delay > deadline:',
+          '                raise',
+          '            time.sleep(delay)',
+          '            delay = min(delay * 2, 30)',
+          '',
+          'def handler(event, context):',
+          '    if event["RequestType"] == "Delete":',
+          '        return {"PhysicalResourceId": "grant-zetl-lf"}',
+          '    p = event["ResourceProperties"]',
+          '    bucket_arn, catalog_id, role_arn = p["TableBucketArn"], p["CatalogId"], p["RoleArn"]',
+          '    s3t = boto3.client("s3tables"); lf = boto3.client("lakeformation")',
+          '    granted, failed = 0, []',
+          '    for page in s3t.get_paginator("list_namespaces").paginate(tableBucketARN=bucket_arn):',
+          '        for entry in page["namespaces"]:',
+          '            ns = entry["namespace"][0]',
+          '            if not ns.startswith("zetl_"):',
+          '                continue',
+          '            for t in s3t.list_tables(tableBucketARN=bucket_arn, namespace=ns).get("tables", []):',
+          '                try:',
+          '                    _grant(lf, role_arn, catalog_id, ns, t["name"])',
+          '                    granted += 1',
+          '                except Exception as e:',
+          '                    failed.append(ns + "." + t["name"] + ": " + str(e))',
+          '                    if isinstance(e, lf.exceptions.AccessDeniedException):',
+          '                        break  # same denial for every table; do not burn the retry budget 24x',
+          '    print("granted " + str(granted) + " table permissions")',
+          '    if failed:',
+          '        # Fail the deploy: a silently-skipped grant leaves the MV job unable',
+          '        # to see its source tables, and every scheduled run then fails.',
+          '        raise RuntimeError(str(len(failed)) + " zetl LF grant(s) failed; first: " + failed[0])',
+          '    return {"PhysicalResourceId": "grant-zetl-lf", "Data": {"granted": granted}}',
+        ].join('\n')
+      ),
     });
+    grantZetlLfFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['s3tables:ListNamespaces', 's3tables:ListTables', 's3tables:GetTable'],
+        resources: ['*'],
+      })
+    );
+    // GetDataAccess is NOT optional here even though this Lambda never vends
+    // credentials: on the S3 Tables federated catalog, GrantPermissions resolves
+    // the target table through Lake Formation's own data-access path, and without
+    // it every grant fails with the misleading "Insufficient Glue permissions to
+    // access table" — identical to the error for missing glue:GetTable. Bisected
+    // live on 2026-11-05: LF admin + glue reads alone still fail; adding
+    // GetDataAccess is what flips the grants to success.
+    grantZetlLfFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['lakeformation:GrantPermissions', 'lakeformation:GetDataAccess'],
+        resources: ['*'],
+      })
+    );
+    // LF GrantPermissions reads the target through the Glue catalog; without
+    // these every grant fails "Insufficient Glue permissions to access table".
+    grantZetlLfFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['glue:GetCatalog', 'glue:GetDatabase', 'glue:GetTable'],
+        resources: ['*'],
+      })
+    );
+    // The grantor holds no grantable permissions on the zetl_* tables (Zero-ETL
+    // creates them), so it can only grant as an LF admin. See LfAdminRegistration.
+    const grantZetlLfAdmin = new LfAdminRegistration(this, 'GrantZetlLfAdminSettings', {
+      adminArns: [grantZetlLfFn.role!.roleArn],
+    });
+
+    const grantZetlProvider = new cr.Provider(this, 'GrantZetlLfProvider', {
+      onEventHandler: grantZetlLfFn,
+    });
+    const grantZetlLf = new cdk.CustomResource(this, 'GrantZetlLfPermissions', {
+      serviceToken: grantZetlProvider.serviceToken,
+      properties: {
+        TableBucketArn: tableBucketArn,
+        CatalogId: s3tCatalogId,
+        RoleArn: jobRole.roleArn,
+        // Re-run discovery+grant on every deploy so new zetl_* namespaces are covered.
+        Nonce: Date.now().toString(),
+      },
+    });
+    grantZetlLf.node.addDependency(grantZetlLfAdmin);
 
     // Grant CREATE_TABLE on the target 'normalized' namespace
     const lfNormalizedGrant = new lakeformation.CfnPermissions(this, 'LFNormalizedDbGrant', {
@@ -237,6 +329,13 @@ export class NormalizedViewsStack extends cdk.Stack {
         '--account_id': this.account,
         '--region': this.region,
         '--refresh_hours': String(refreshHours),
+        // pyiceberg is needed to capture/restore Iceberg column doc strings +
+        // table description across the delete/recreate refresh. S3Tables
+        // federation does NOT durably persist Glue Comments/Description (it
+        // reconciles them back from the Iceberg schema), so the curated
+        // metadata_agent descriptions must be re-applied directly to the
+        // Iceberg schema via pyiceberg — mirroring the agent's own write path.
+        '--additional-python-modules': 'pyiceberg==0.7.1',
       },
       executionProperty: { maxConcurrentRuns: 1 },
       timeout: 120,

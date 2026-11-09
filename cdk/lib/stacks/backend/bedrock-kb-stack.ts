@@ -13,6 +13,12 @@ export interface BedrockKnowledgeBaseStackProps extends StackProps {
   projectName: string;
   artifactsBucket: s3.Bucket;
   autoStartIngestion?: boolean;
+  /**
+   * When false, the semantic-rag KB and its data source are not provisioned.
+   * The ontology-patterns KB is unaffected.
+   * @default false
+   */
+  enableSemanticRag?: boolean;
 }
 
 /**
@@ -39,13 +45,10 @@ export class BedrockKnowledgeBaseStack extends Stack {
   public readonly ontologyPatternsDataSource: bedrock.CfnDataSource;
 
   // ── Semantic RAG KB ──────────────────────────────────────────────────────────
-  public readonly semanticRagKb: bedrock.CfnKnowledgeBase;
-  public readonly semanticRagKbId: string;
-  public readonly semanticRagDataSource: bedrock.CfnDataSource;
-  public readonly semanticRagDataSourceId: string;
-
-  /** @deprecated Use ontologyPatternsKbId — kept for backwards compatibility */
-  public readonly knowledgeBaseId: string;
+  public readonly semanticRagKb?: bedrock.CfnKnowledgeBase;
+  public readonly semanticRagKbId?: string;
+  public readonly semanticRagDataSource?: bedrock.CfnDataSource;
+  public readonly semanticRagDataSourceId?: string;
 
   constructor(scope: Construct, id: string, props: BedrockKnowledgeBaseStackProps) {
     super(scope, id, props);
@@ -102,7 +105,23 @@ export class BedrockKnowledgeBaseStack extends Stack {
             inclusionPrefixes: ['ontology-patterns/'],
           },
         },
-        vectorIngestionConfiguration: { chunkingConfiguration: { chunkingStrategy: 'NONE' } },
+        // HIERARCHICAL chunking: the FIBO/FHIR/ACORD/W3C docs are deeply-nested markdown
+        // (## Classes / ### <class>) and range up to ~1.2M chars — far beyond Titan v2's
+        // 8,192-token embed limit, so 'NONE' (one chunk per file) silently dropped the
+        // largest docs and overflowed downstream judge models. Embed small 300-token
+        // children for precise retrieval, return the 1,500-token parent for full context.
+        vectorIngestionConfiguration: {
+          chunkingConfiguration: {
+            chunkingStrategy: 'HIERARCHICAL',
+            hierarchicalChunkingConfiguration: {
+              overlapTokens: 60,
+              levelConfigurations: [
+                { maxTokens: 1500 }, // parent (layer 1) — returned to the agent
+                { maxTokens: 300 }, // child (layer 2) — embedded & matched
+              ],
+            },
+          },
+        },
       }
     );
     this.ontologyPatternsDataSource.addDependency(this.ontologyPatternsKb);
@@ -126,63 +145,93 @@ export class BedrockKnowledgeBaseStack extends Stack {
 
     // ── 2. Semantic RAG KB ────────────────────────────────────────────────────
 
-    const ragVectorBucket = this.createVectorBucket(
-      `${p}-RagVectorBucket`,
-      `${p}-rag-vectors-${this.account}`
-    );
-    const ragVectorIndex = this.createVectorIndex(
-      `${p}-RagVectorIndex`,
-      ragVectorBucket,
-      `${p}-rag-idx`
-    );
-    ragVectorIndex.node.addDependency(ragVectorBucket);
-
-    const ragRole = this.createKbRole(
-      `${p}-SemanticRagKbRole`,
-      `${p}-rag`,
-      props.artifactsBucket,
-      ragVectorBucket
-    );
-    ragRole.node.addDependency(ragVectorBucket);
-
-    this.semanticRagKb = new bedrock.CfnKnowledgeBase(this, 'SemanticRagKB', {
-      name: `${p}-semantic-rag`,
-      description:
-        'Semantic RAG — business term aliases, column descriptions, and example queries for actual table data. Written by the metadata agent at runtime.',
-      roleArn: ragRole.roleArn,
-      knowledgeBaseConfiguration: this.vectorKbConfig(),
-      storageConfiguration: this.s3VectorStorageConfig(
-        ragVectorBucket.attrVectorBucketArn,
+    if (props.enableSemanticRag === true) {
+      const ragVectorBucket = this.createVectorBucket(
+        `${p}-RagVectorBucket`,
+        `${p}-rag-vectors-${this.account}`
+      );
+      const ragVectorIndex = this.createVectorIndex(
+        `${p}-RagVectorIndex`,
+        ragVectorBucket,
         `${p}-rag-idx`
-      ),
-    });
-    this.semanticRagKb.node.addDependency(ragVectorIndex);
-    this.semanticRagKb.node.addDependency(ragRole);
-    this.semanticRagKbId = this.semanticRagKb.attrKnowledgeBaseId;
+      );
+      ragVectorIndex.node.addDependency(ragVectorBucket);
 
-    this.semanticRagDataSource = new bedrock.CfnDataSource(this, 'SemanticRagDataSource', {
-      knowledgeBaseId: this.semanticRagKbId,
-      dataDeletionPolicy: 'RETAIN',
-      name: `${p}-semantic-rag-ds`,
-      description:
-        'Runtime-generated metadata docs written by the metadata agent (metadata/{db}/{table}.md).',
-      dataSourceConfiguration: {
-        type: 'S3',
-        s3Configuration: {
-          bucketArn: props.artifactsBucket.bucketArn,
-          inclusionPrefixes: ['metadata/'],
+      const ragRole = this.createKbRole(
+        `${p}-SemanticRagKbRole`,
+        `${p}-rag`,
+        props.artifactsBucket,
+        ragVectorBucket
+      );
+      ragRole.node.addDependency(ragVectorBucket);
+
+      this.semanticRagKb = new bedrock.CfnKnowledgeBase(this, 'SemanticRagKB', {
+        name: `${p}-semantic-rag`,
+        description:
+          'Semantic RAG — business term aliases, column descriptions, and example queries for actual table data. Written by the metadata agent at runtime.',
+        roleArn: ragRole.roleArn,
+        knowledgeBaseConfiguration: this.vectorKbConfig(),
+        storageConfiguration: this.s3VectorStorageConfig(
+          ragVectorBucket.attrVectorBucketArn,
+          `${p}-rag-idx`
+        ),
+      });
+      this.semanticRagKb.node.addDependency(ragVectorIndex);
+      this.semanticRagKb.node.addDependency(ragRole);
+      this.semanticRagKbId = this.semanticRagKb.attrKnowledgeBaseId;
+
+      this.semanticRagDataSource = new bedrock.CfnDataSource(this, 'SemanticRagDataSource', {
+        knowledgeBaseId: this.semanticRagKbId,
+        dataDeletionPolicy: 'RETAIN',
+        // Renamed (-h2) so the HIERARCHICAL-chunking switch can REPLACE this data
+        // source: chunkingConfiguration is immutable, so CFN create-before-deletes
+        // a new DataSource — Bedrock rejects a duplicate name within the KB, so the
+        // replacement must carry a distinct name. The old FIXED_SIZE source
+        // (…-semantic-rag-ds) is deleted after the new one is created.
+        name: `${p}-semantic-rag-ds-h3`,
+        description:
+          'Runtime-generated metadata docs written by the metadata agent (metadata/{db}/{table}.md).',
+        dataSourceConfiguration: {
+          type: 'S3',
+          s3Configuration: {
+            bucketArn: props.artifactsBucket.bucketArn,
+            inclusionPrefixes: ['metadata/'],
+          },
         },
-      },
-      vectorIngestionConfiguration: { chunkingConfiguration: { chunkingStrategy: 'NONE' } },
-    });
-    this.semanticRagDataSource.addDependency(this.semanticRagKb);
-    this.semanticRagDataSourceId = this.semanticRagDataSource.attrDataSourceId;
+        // HIERARCHICAL chunking: a per-table metadata doc is ONE logical unit, but
+        // FIXED_SIZE(512) split each into 3-5 sibling chunks that competed
+        // independently for the ~20-result retrieval cap — diluting a big table's
+        // signal across several vectors and letting small lexical-match docs (e.g.
+        // an empty bridge table) out-rank the table that actually answers the
+        // question. HIERARCHICAL embeds small precise CHILD chunks (a section:
+        // Overview / Columns / Business Concepts) but returns the PARENT (the whole
+        // table doc, deduped to one candidate by the topic router), so each table is
+        // one retrieval unit with precise matching + full context. Parent 2000 tokens
+        // holds a full table doc; child 400 ≈ one ## section. Mirrors the
+        // ontology-patterns KB strategy above.
+        vectorIngestionConfiguration: {
+          chunkingConfiguration: {
+            chunkingStrategy: 'HIERARCHICAL',
+            hierarchicalChunkingConfiguration: {
+              overlapTokens: 60,
+              levelConfigurations: [
+                { maxTokens: 2000 }, // parent (layer 1) — the full table doc, returned to the agent
+                { maxTokens: 800 }, // child (layer 2) — a fuller section; 400 over-fragmented this
+                // templated corpus so boilerplate sub-sections (audit cols,
+                // is_deleted notes) won out — 800 keeps a section's signal intact
+              ],
+            },
+          },
+        },
+      });
+      this.semanticRagDataSource.addDependency(this.semanticRagKb);
+      this.semanticRagDataSourceId = this.semanticRagDataSource.attrDataSourceId;
+    } else {
+      // Public properties remain undefined; downstream stacks must guard on enableSemanticRag.
+    }
 
     // No deploy-time sync for Semantic RAG KB — docs are generated at runtime by
     // the metadata agent and ingestion is triggered by that agent after each write.
-
-    // ── Backwards-compatibility alias ─────────────────────────────────────────
-    this.knowledgeBaseId = this.ontologyPatternsKbId;
 
     // ── CloudFormation Outputs ────────────────────────────────────────────────
 
@@ -196,16 +245,18 @@ export class BedrockKnowledgeBaseStack extends Stack {
       description: 'Ontology Patterns KB data source ID',
     });
 
-    new CfnOutput(this, 'SemanticRagKbId', {
-      value: this.semanticRagKbId,
-      description: 'Semantic RAG KB ID (used by ontology_query_agent, metadata_query_agent)',
-      exportName: `${p}-semantic-rag-kb-id`,
-    });
-    new CfnOutput(this, 'SemanticRagDataSourceId', {
-      value: this.semanticRagDataSourceId,
-      description: 'Semantic RAG KB data source ID (used by metadata_agent to trigger ingestion)',
-      exportName: `${p}-semantic-rag-ds-id`,
-    });
+    if (this.semanticRagKbId !== undefined && this.semanticRagDataSourceId !== undefined) {
+      new CfnOutput(this, 'SemanticRagKbId', {
+        value: this.semanticRagKbId,
+        description: 'Semantic RAG KB ID (used by ontology_query_agent, metadata_query_agent)',
+        exportName: `${p}-semantic-rag-kb-id`,
+      });
+      new CfnOutput(this, 'SemanticRagDataSourceId', {
+        value: this.semanticRagDataSourceId,
+        description: 'Semantic RAG KB data source ID (used by metadata_agent to trigger ingestion)',
+        exportName: `${p}-semantic-rag-ds-id`,
+      });
+    }
   }
 
   // ── Private helpers ──────────────────────────────────────────────────────────
@@ -306,8 +357,24 @@ export class BedrockKnowledgeBaseStack extends Stack {
     role.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
+        // Covers both the Titan embedding model used for ingestion/query AND the
+        // Cohere Rerank 3.5 model (cohere.rerank-v3-5:0) invoked during a reranked
+        // Retrieve — both are foundation-model/* ARNs in this Region.
         actions: ['bedrock:InvokeModel'],
         resources: [`arn:aws:bedrock:${this.region}::foundation-model/*`],
+      })
+    );
+
+    // Reranking during Retrieve: the KB service role (NOT the caller) performs the
+    // bedrock:Rerank call, so it must be authorized for that action. Without this,
+    // a reranked Retrieve fails with "is not authorized to perform: bedrock:Rerank
+    // because no identity-based policy allows the bedrock:Rerank action". The Rerank
+    // action does not support resource-level scoping, so Resource must be "*".
+    role.addToPolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['bedrock:Rerank'],
+        resources: ['*'],
       })
     );
 
@@ -390,9 +457,27 @@ def handler(event, context):
         kb_id = event['ResourceProperties']['KnowledgeBaseId']
         ds_id = event['ResourceProperties']['DataSourceId'].replace(kb_id, '').replace('|', '')
         client = boto3.client('bedrock-agent', region_name=os.environ['AWS_REGION'])
-        job = client.start_ingestion_job(knowledgeBaseId=kb_id, dataSourceId=ds_id)
-        send(event, context, SUCCESS, {'IngestionJobId': job['ingestionJob']['ingestionJobId']})
+        try:
+            job = client.start_ingestion_job(knowledgeBaseId=kb_id, dataSourceId=ds_id)
+            print(f"Started ingestion job {job['ingestionJob']['ingestionJobId']} kb={kb_id} ds={ds_id}")
+            send(event, context, SUCCESS, {'IngestionJobId': job['ingestionJob']['ingestionJobId']})
+        except client.exceptions.ConflictException as e:
+            # A job is already running on this data source — the sync we wanted is
+            # already happening, so this is a no-op success, not a failure.
+            print(f"Ingestion already in progress kb={kb_id} ds={ds_id}; success (no-op): {e}")
+            send(event, context, SUCCESS, {'IngestionJobId': 'already-running'})
+        except client.exceptions.ResourceNotFoundException as e:
+            # During a DataSource REPLACEMENT (e.g. a chunking-strategy change) this
+            # trigger can fire against the OLD data source id while CFN deletes it.
+            # The replacement data source has its own trigger; a missing source here
+            # is benign and must NOT fail the stack (else the whole update rolls back).
+            print(f"Data source not found (likely mid-replacement) kb={kb_id} ds={ds_id}; success (no-op): {e}")
+            send(event, context, SUCCESS, {'IngestionJobId': 'data-source-absent'})
     except Exception as e:
+        # Log the real error — the CFN Reason field only ever says "See CloudWatch".
+        import traceback
+        # nosemgrep: missing-template-string-indicator — real Python f-string (embedded Lambda src), intentional
+        print(f"OpSync ingestion trigger FAILED: {e}\\n{traceback.format_exc()}")
         send(event, context, FAILED, {'Error': str(e)})
 `),
     });

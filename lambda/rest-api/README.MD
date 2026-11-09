@@ -17,111 +17,139 @@ The application is containerized using Docker and deployed to AWS Lambda (up to 
 ### Key Components
 
 **Core Infrastructure:**
+
 - **main.py** - Lambda handler with Mangum adapter, mounts all sub-applications
 - **auth.py** - JWT token validation using AWS Cognito JWKS
 - **Dockerfile** - Container definition for Lambda deployment
 
-**API Applications (4):**
-- **ontology_api.py** - 7 endpoints for ontology management
-- **datasource_api.py** - 6 endpoints for data source operations (AWS Glue)
-- **query_api.py** - 5 endpoints for natural language query processing
-- **neptune_api.py** - 6 endpoints for knowledge graph operations (Amazon Neptune)
+**Mounted sub-applications** (mounted in `main.py`):
 
-**Services (4):**
-- **services/ontology_service.py** - Ontology configuration and generation using Amazon Bedrock
-- **services/glue_service.py** - AWS Glue Data Catalog integration
-- **services/query_service.py** - Natural language to SQL conversion and Athena execution
-- **services/neptune_service.py** - Amazon Neptune SPARQL query and graph operations
+- **ontology_api.py** (`/ontology`) - ontology config, build, versioning, upload
+- **datasource_api.py** (`/datasource`) - Glue Data Catalog browsing + metadata extraction
+- **query_api.py** (`/query`) - suggested questions, chat-session list/rehydrate/archive, per-turn feedback (natural-language querying itself is served by the streaming **Chat Gateway**, not an async REST submit/status/result path)
+- **neptune_api.py** (`/neptune`) - Neptune graph summary / stats / classes / properties
+- **metadata_api.py** (`/metadata`) - Semantic-RAG enrichment, revision, single-table KB metadata (mounted only when `enableSemanticRag`)
+- **lessons_api.py** (`/lessons`) - AgentCore Memory lessons (admin Lessons tab)
+- **feedback_api.py** (`/feedback`) - 👍/👎 turn ratings (admin Feedback tab)
+- **documents_api.py** (`/documents`) - supplementary docs → doc-pipeline → KB
+- **groundtruth_api.py** (`/groundtruth`) - per-layer evaluation dataset
+- **evaluations_api.py** (`/evaluations`) - AgentCore evaluation runs
+- **routers/metrics.py** (`/metrics`) - governed-metrics CRUD + lifecycle (Tier 1); mounted only when `METRICS_TABLE` is set
+
+**Services** (`services/`):
+
+- **ontology_service.py** - ontology configuration, versioning, and generation orchestration
+- **glue_service.py** - AWS Glue Data Catalog integration
+- **agentcore_service.py** - invokes the AgentCore query/enrichment runtimes
+- **neptune_service.py** - Amazon Neptune SPARQL query and graph operations
+- **guardrail_service.py** - Bedrock Guardrails INPUT/OUTPUT screening + PII redaction
+- **chat_session_service.py** / **feedback_service.py** / **agentcore_memory_service.py** - chat transcripts, feedback, and lessons stores
+- **metadata_service.py** / **metric_service.py** - Semantic-RAG enrichment + governed metrics
+- **document_service.py** / **groundtruth_service.py** / **evaluation_service.py** - doc pipeline, ground truth, and evaluation runs
+- **identity_service.py** / **obo_middleware.py** - gated on-behalf-of (OBO) identity exchange (off by default)
 
 ## Environment Variables
 
 The following environment variables are configured by the CDK stack:
 
-| Variable | Description | Set By |
-|----------|-------------|--------|
-| AWS_REGION | AWS region (auto-provided by Lambda runtime) | Lambda |
-| STACK_NAME | CDK stack name prefix | CDK |
-| STACK_ENVIRONMENT | Environment (dev/staging/prod) | CDK |
-| DATA_BUCKET | S3 bucket name for file storage | CDK |
-| COGNITO_USER_POOL_ID | Cognito User Pool ID | CDK |
-| COGNITO_APP_CLIENT_ID | Cognito App Client ID | CDK |
-| ATHENA_DATABASE | Athena database name | CDK |
-| ATHENA_WORKGROUP | Athena workgroup name | CDK |
-| NEPTUNE_CONNECTION_SECRET_NAME | Secrets Manager secret name for Neptune connection (optional) | CDK |
-| NEPTUNE_ENDPOINT | Neptune cluster endpoint (optional, legacy - use secret instead) | CDK |
-| NEPTUNE_LOADER_ROLE_ARN | IAM role for Neptune loader (optional, legacy - use secret instead) | CDK |
-| ONTOLOGY_GENERATION_MODEL_ID | Bedrock model for ontology generation | CDK |
-| TEXT_TO_SQL_MODEL_ID | Bedrock model for text-to-SQL | CDK |
+| Variable                       | Description                                                                 | Set By |
+| ------------------------------ | --------------------------------------------------------------------------- | ------ |
+| AWS_REGION                     | AWS region (auto-provided by Lambda runtime)                                | Lambda |
+| STACK_NAME                     | CDK stack name prefix                                                       | CDK    |
+| STACK_ENVIRONMENT              | Environment (dev/staging/prod)                                              | CDK    |
+| DATA_BUCKET                    | S3 bucket name for file storage                                             | CDK    |
+| COGNITO_USER_POOL_ID           | Cognito User Pool ID                                                        | CDK    |
+| COGNITO_APP_CLIENT_ID          | Cognito App Client ID                                                       | CDK    |
+| ATHENA_DATABASE                | Athena database name                                                        | CDK    |
+| ATHENA_WORKGROUP               | Athena workgroup name                                                       | CDK    |
+| NEPTUNE_CONNECTION_SECRET_NAME | Secrets Manager secret name for Neptune connection (optional)               | CDK    |
+| NEPTUNE_ENDPOINT               | Neptune cluster endpoint (optional fallback when the secret is unavailable) | CDK    |
+| ONTOLOGY_GENERATION_MODEL_ID   | Bedrock model for ontology generation                                       | CDK    |
+| TEXT_TO_SQL_MODEL_ID           | Bedrock model for text-to-SQL                                               | CDK    |
 
 **Neptune Configuration:**
+
 - The Lambda function automatically retrieves Neptune connection details from AWS Secrets Manager when `NEPTUNE_CONNECTION_SECRET_NAME` is provided
 - The secret contains: endpoint, readerEndpoint, port, sparqlEndpoint, loaderEndpoint, and loaderRoleArn
 - This approach avoids cyclic dependencies in CDK deployment
-- Legacy environment variables (`NEPTUNE_ENDPOINT`, `NEPTUNE_LOADER_ROLE_ARN`) are still supported for backward compatibility
+- `NEPTUNE_ENDPOINT` is read only as a fallback when the secret is unavailable
 
 ## API Endpoints
 
 All endpoints are served through API Gateway at `https://<api-gateway-url>/*` with JWT authentication (except `/health`).
 
 ### Health & Status (No Auth)
+
 - `GET /health` - Health check for monitoring/ALB
 - `GET /status` - System status and configuration
 
-### Ontology API (`/ontology/*`) - 7 endpoints
+### Ontology API (`/ontology/*`)
 
 **Configuration:**
+
 - `POST /ontology/config` - Create/update ontology configuration
 - `GET /ontology/config/{ontology_id}` - Get ontology configuration
 - `GET /ontology/list` - List all ontologies
 - `DELETE /ontology/config/{ontology_id}` - Delete ontology
 
 **Building:**
+
 - `POST /ontology/build/{ontology_id}` - Build ontology from data sources
 - `GET /ontology/build-status/{ontology_id}` - Get build status
 
-**Upload:**
-- `POST /ontology/upload` - Upload ontology file (OWL, RDF, Turtle, Markdown)
+**Versioning:**
 
-### Data Source API (`/datasource/*`) - 6 endpoints
+- `GET /ontology/versions/{ontology_id}` - List ontology version history
+- `GET /ontology/content/{ontology_id}/{version_id}` - Retrieve version content
+- `POST /ontology/revise/{ontology_id}/{version_id}` - Start a versioned revision
+
+**Upload:**
+
+- `POST /ontology/upload` - Upload reference document (OWL, RDF, Turtle, Markdown)
+
+### Data Source API (`/datasource/*`)
 
 **Glue Catalog:**
+
 - `GET /datasource/glue/databases` - List all Glue databases
 - `GET /datasource/glue/tables/{database_name}` - List tables in database
 - `GET /datasource/glue/metadata/{database_name}/{table_name}` - Get table metadata
 
 **Metadata:**
+
 - `POST /datasource/extract-metadata` - Extract metadata for ontology generation
 
-**Crawlers:**
-- `POST /datasource/glue/crawler/{crawler_name}/start` - Start Glue crawler
-- `GET /datasource/glue/crawler/{crawler_name}/status` - Get crawler status
+### Query API (`/query/*`)
 
-### Query API (`/query/*`) - 5 endpoints
+> Natural-language querying is served by the streaming **Chat AgentCore Gateway** (SSE),
+> not by this REST API. There is no async `submit`/`status`/`result` surface here.
 
-**Query Execution:**
-- `POST /query/submit` - Submit natural language query
-- `GET /query/result/{query_id}` - Get query results
-- `GET /query/status/{query_id}` - Get query status
+- `GET /query/suggestions/{ontology_id}` - AI-generated suggested questions (synchronous)
+- `GET /query/sessions` · `GET /query/sessions/{session_id}` · `DELETE /query/sessions/{session_id}` - chat session list / transcript rehydrate / archive
+- `POST /query/feedback` - record a 👍/👎 turn rating (+ optional comment)
 
-**History:**
-- `GET /query/history?limit=50` - List query history
-- `DELETE /query/{query_id}` - Delete query from history
+### Neptune API (`/neptune/*`)
 
-### Neptune API (`/neptune/*`) - 6 endpoints
-
-**SPARQL:**
-- `POST /neptune/sparql` - Execute SPARQL query
-
-**Graph Info:**
 - `GET /neptune/graph/summary/{ontology_id}` - Get graph summary
 - `GET /neptune/graph/stats/{ontology_id}` - Get detailed statistics
+- `GET /neptune/graph/classes/{ontology_id}` - List ontology classes
+- `GET /neptune/graph/properties/{ontology_id}` - List ontology properties
 
-**Loading:**
-- `POST /neptune/load` - Load ontology from S3 to Neptune
-- `GET /neptune/load/status/{load_id}` - Get load job status
+### Metadata API (`/metadata/*`, Semantic RAG)
 
-**Management:**
-- `DELETE /neptune/graph/{ontology_id}` - Clear graph data
+- `POST /metadata/enrich` - trigger the Metadata Agent (accepts optional `annotations` for annotation-only mode)
+- `GET /metadata/enrich/status/{job_id}` - poll enrichment progress
+- `POST /metadata/revise/{id}/{version_id}` - start a versioned metadata revision
+- `GET /metadata/table/{database_name}/{table_name}` - get AI-enriched KB metadata for a single table
+
+### Platform APIs
+
+- `/lessons/{id}` - AgentCore Memory lessons (list/delete) for the admin Lessons tab
+- `/feedback/{id}` - feedback records (list/delete) for the admin Feedback tab
+- `/documents/{id}` - supplementary docs upload/list/delete → doc-pipeline → KB
+- `/groundtruth/{id}` - per-layer ground-truth dataset upload/get/delete
+- `/evaluations/{id}` - AgentCore evaluation runs (list/get/trigger/delete)
+- `/metrics/namespaces/{ns}/metrics` - governed-metrics CRUD + `:publish` lifecycle (Tier 1; mounted only when `METRICS_TABLE` is set)
 
 ## Response Format
 

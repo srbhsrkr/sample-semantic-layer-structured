@@ -7,6 +7,7 @@ import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as agentcore from 'aws-cdk-lib/aws-bedrockagentcore';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { ArmBuildConstruct } from '../../../common/constructs/arm-build-construct';
@@ -80,13 +81,26 @@ export class AgentCoreNeptuneGateway extends Construct {
       ],
     });
 
+    // cdk-nag: AWSLambdaVPCAccessExecutionRole is the documented Lambda
+    // pattern for ENI lifecycle management when running inside a VPC; no
+    // narrower customer-managed equivalent without re-implementing the
+    // exact resource-* grants AWS already maintains for this role.
+    NagSuppressions.addResourceSuppressions(lambdaRole, [
+      {
+        id: 'AwsSolutions-IAM4',
+        reason:
+          'AWSLambdaVPCAccessExecutionRole is the AWS-recommended managed policy for Lambda ENI lifecycle inside a VPC.',
+        appliesTo: [
+          'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole',
+        ],
+      },
+    ]);
+
     // Grant Neptune access
     lambdaRole.addToPolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
-        actions: [
-          'neptune-db:*',
-        ],
+        actions: ['neptune-db:*'],
         resources: ['*'], // Neptune doesn't support resource-level permissions
       })
     );
@@ -146,12 +160,86 @@ export class AgentCoreNeptuneGateway extends Construct {
     });
 
     // ============================================================
+    // Ontop SPARQL->SQL translate Lambda (VKG Phase 5)
+    // ============================================================
+    // Translate-only: the agent passes the ontologyJson payload in, so this
+    // Lambda needs NO VPC and NO Neptune/Athena IAM — it only reformulates
+    // SPARQL into Athena SQL using the in-payload ontology mappings. It is a
+    // separate Java/JVM Lambda; the gateway routes per-target by lambdaArn, so
+    // two Lambdas behind one gateway is fine. PC=1 keeps the JVM warm.
+    const ontopBuild = new ArmBuildConstruct(this, 'OntopTranslateArmBuild', {
+      sourcePath: '../lambda/ontop-translate',
+      region: cdk.Stack.of(this).region,
+      namePrefix: `${props.projectName}-ontop-translate`,
+      buildTimeoutMinutes: 20, // Maven shade of Ontop is slower than pip
+    });
+
+    const ontopRole = new iam.Role(this, 'OntopTranslateRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+      ],
+      description: 'Execution role for the Ontop SPARQL-to-SQL translate Lambda',
+    });
+
+    // cdk-nag: AWSLambdaBasicExecutionRole only grants CloudWatch Logs write
+    // (the documented minimal Lambda execution role). This Lambda has no VPC
+    // and no Neptune/Athena access, so no narrower customer-managed policy is
+    // warranted.
+    NagSuppressions.addResourceSuppressions(ontopRole, [
+      {
+        id: 'AwsSolutions-IAM4',
+        reason:
+          'AWSLambdaBasicExecutionRole is the AWS-recommended minimal managed policy for Lambda CloudWatch Logs access.',
+        appliesTo: [
+          'Policy::arn:<AWS::Partition>:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+        ],
+      },
+    ]);
+
+    ontopBuild.repository.grantPull(ontopRole);
+
+    const ontopFn = new lambda.DockerImageFunction(this, 'OntopTranslateFunction', {
+      functionName: `${props.projectName}-ontop-translate`,
+      code: lambda.DockerImageCode.fromEcr(ontopBuild.repository, {
+        tagOrDigest: ontopBuild.imageTag,
+      }),
+      architecture: lambda.Architecture.ARM_64,
+      role: ontopRole,
+      timeout: cdk.Duration.seconds(60),
+      memorySize: 2048, // JVM + Ontop reformulation
+      logRetention: logs.RetentionDays.ONE_WEEK,
+      description: 'Ontop translate-only SPARQL-to-Athena SQL (VKG Phase 5)',
+    });
+
+    // Ensure Lambda is created after the build completes
+    ontopFn.node.addDependency(ontopBuild.buildCompletion);
+
+    // PC=1 requires a Version/alias — keep the JVM warm to avoid cold starts.
+    const ontopAlias = new lambda.Alias(this, 'OntopTranslateAlias', {
+      aliasName: 'live',
+      version: ontopFn.currentVersion,
+      provisionedConcurrentExecutions: 1, // keep the JVM warm — no cold start
+    });
+
+    // Grant Gateway role permission to invoke the alias
+    ontopAlias.grantInvoke(this.gatewayRole);
+
+    // Also add principal-based permission for Gateway service
+    ontopAlias.addPermission('AllowGatewayInvokeOntop', {
+      principal: new iam.ServicePrincipal('bedrock-agentcore.amazonaws.com'),
+      action: 'lambda:InvokeFunction',
+      sourceArn: `arn:aws:bedrock-agentcore:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:gateway/*`,
+    });
+
+    // ============================================================
     // AgentCore Gateway (AWS_IAM authentication)
     // ============================================================
 
     this.gateway = new agentcore.CfnGateway(this, 'NeptuneGateway', {
       name: `${props.projectName}-neptune-gateway`,
-      description: 'Neptune SPARQL tools: discover graphs, read/write ontologies, execute queries, graph statistics',
+      description:
+        'Neptune SPARQL tools: discover graphs, read/write ontologies, execute queries, graph statistics',
       roleArn: this.gatewayRole.roleArn,
       authorizerType: 'AWS_IAM',
       protocolType: 'MCP',
@@ -225,7 +313,8 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'get_ontology_from_neptune',
-                  description: 'Read full ontology (classes, properties, mappings, databases) from Neptune for a given ontology_id (UUID)',
+                  description:
+                    'Read full ontology (classes, properties, mappings, databases) from Neptune for a given ontology_id (UUID)',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -262,7 +351,8 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'persist_to_neptune',
-                  description: 'Persist RDF n-quad data to Neptune database using SPARQL INSERT DATA',
+                  description:
+                    'Persist RDF n-quad data to Neptune database using SPARQL INSERT DATA',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -299,13 +389,15 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'delete_graph',
-                  description: 'Delete (drop) all triples in the named graph for a given ontology_id. Use this to clean up or regenerate an ontology.',
+                  description:
+                    'Delete (drop) all triples in the named graph for a given ontology_id. Use this to clean up or regenerate an ontology.',
                   inputSchema: {
                     type: 'object',
                     properties: {
                       ontology_id: {
                         type: 'string',
-                        description: 'Ontology identifier (UUID) whose named graph should be dropped',
+                        description:
+                          'Ontology identifier (UUID) whose named graph should be dropped',
                       },
                     },
                     required: ['ontology_id'],
@@ -336,7 +428,10 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'execute_sparql_query',
-                  description: 'Execute a generic SPARQL query against Neptune (SELECT or UPDATE)',
+                  description:
+                    'Execute a generic SPARQL query against Neptune (SELECT, CONSTRUCT, DESCRIBE, or UPDATE). ' +
+                    'SELECT returns SPARQL-results JSON; CONSTRUCT/DESCRIBE return an RDF graph as Turtle ' +
+                    '(in a {"turtle": ...} field); UPDATE returns a success status.',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -346,7 +441,8 @@ export class AgentCoreNeptuneGateway extends Construct {
                       },
                       query_type: {
                         type: 'string',
-                        description: 'Type of query: SELECT or UPDATE (default: SELECT)',
+                        description:
+                          'Type of query: SELECT, CONSTRUCT, DESCRIBE, or UPDATE (default: SELECT)',
                       },
                     },
                     required: ['sparql_query'],
@@ -377,7 +473,8 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'get_graph_summary',
-                  description: 'Get summary statistics for an ontology graph (class count, property count, triple count)',
+                  description:
+                    'Get summary statistics for an ontology graph (class count, property count, triple count)',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -414,7 +511,8 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'get_graph_stats',
-                  description: 'Get class distribution statistics for an ontology graph (top 20 classes by instance count)',
+                  description:
+                    'Get class distribution statistics for an ontology graph (top 20 classes by instance count)',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -451,7 +549,8 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'get_graph_classes',
-                  description: 'Get list of all classes in the ontology with URIs, labels, and comments',
+                  description:
+                    'Get list of all classes in the ontology with URIs, labels, and comments',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -488,7 +587,8 @@ export class AgentCoreNeptuneGateway extends Construct {
               inlinePayload: [
                 {
                   name: 'get_graph_properties',
-                  description: 'Get list of all properties in the ontology with URIs, labels, and comments',
+                  description:
+                    'Get list of all properties in the ontology with URIs, labels, and comments',
                   inputSchema: {
                     type: 'object',
                     properties: {
@@ -506,6 +606,79 @@ export class AgentCoreNeptuneGateway extends Construct {
         },
       },
     });
+
+    // VKG Phase 5 execution: translate a grounded SPARQL SELECT into Athena SQL
+    // via the Ontop translate-only Lambda (separate Java Lambda, served by the
+    // same gateway). lambdaArn points at the PC=1 alias so the gateway always
+    // hits the warm JVM. The agent passes the ontologyJson it already fetched in
+    // Phase 1, so this Lambda needs no Neptune/Athena access.
+    new agentcore.CfnGatewayTarget(this, 'TranslateSparqlToSqlTarget', {
+      name: 'translate-sparql-to-sql',
+      gatewayIdentifier: this.gateway.attrGatewayIdentifier,
+      description: 'Translate a grounded SPARQL query to Athena SQL via Ontop (VKG execution)',
+      credentialProviderConfigurations: [
+        {
+          credentialProviderType: 'GATEWAY_IAM_ROLE',
+        },
+      ],
+      targetConfiguration: {
+        mcp: {
+          lambda: {
+            lambdaArn: ontopAlias.functionArn,
+            toolSchema: {
+              inlinePayload: [
+                {
+                  name: 'translate_sparql_to_sql',
+                  description:
+                    'Translate a grounded SPARQL SELECT into Athena SQL using the ontology mappings. Returns {sql, database, catalog}.',
+                  inputSchema: {
+                    type: 'object',
+                    properties: {
+                      sparql: {
+                        type: 'string',
+                        description: 'The grounded SPARQL SELECT query to translate',
+                      },
+                      ontologyId: {
+                        type: 'string',
+                        description: 'Ontology identifier (used as the reformulator cache key)',
+                      },
+                      ontologyJson: {
+                        type: 'object',
+                        description:
+                          'The get_ontology_from_neptune payload (classes/properties/mappings/databases)',
+                      },
+                    },
+                    required: ['sparql', 'ontologyJson'],
+                  },
+                },
+              ],
+            },
+          },
+        },
+      },
+    });
+
+    // ============================================================
+    // Ordering: targets must wait for the gateway role's invoke permission
+    // ============================================================
+    // AgentCore validates, at CfnGatewayTarget CREATE time, that the gateway
+    // execution role can already invoke the target Lambda — otherwise it rejects
+    // the target ("Gateway execution role lacks permission to invoke Lambda ...").
+    // grantInvoke(this.gatewayRole) above adds that permission to the role's
+    // DEFAULT (inline) policy, but nothing tells CloudFormation to create that
+    // policy before the targets, so on a cold deploy the targets can race ahead
+    // and fail. Make every gateway target explicitly depend on the role's
+    // default policy so the invoke grant is in place first.
+    const gatewayRoleDefaultPolicy = this.gatewayRole.node.tryFindChild(
+      'DefaultPolicy',
+    ) as iam.Policy | undefined;
+    if (gatewayRoleDefaultPolicy) {
+      for (const child of this.node.children) {
+        if (child instanceof agentcore.CfnGatewayTarget) {
+          child.node.addDependency(gatewayRoleDefaultPolicy);
+        }
+      }
+    }
 
     // ============================================================
     // Parameter Store - Gateway Configuration

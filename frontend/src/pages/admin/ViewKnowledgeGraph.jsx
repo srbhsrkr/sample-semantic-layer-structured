@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from "react";
 import {
   Container,
   Header,
@@ -11,20 +11,32 @@ import {
   Badge,
   Table,
   Tabs,
-} from '@cloudscape-design/components';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { neptuneAPI, ontologyAPI } from '../../services/api';
-import GraphVisualization from '../../components/GraphVisualization';
-import OntologyEditor from '../../components/OntologyEditor';
-import { transformGraphData } from '../../utils/graphTransform';
+} from "@cloudscape-design/components";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import {
+  neptuneAPI,
+  ontologyAPI,
+  computeOntologyDelta,
+} from "../../services/api";
+import DeltaPreview from "../../components/DeltaPreview";
+import GraphVisualization from "../../components/GraphVisualization";
+import OntologyEditor from "../../components/OntologyEditor";
+import LessonsLearnedTab from "../../components/LessonsLearnedTab";
+import FeedbackTab from "../../components/FeedbackTab";
+import GovernedMetricsTab from "../../components/GovernedMetricsTab";
+import GovernedRulesTab from "../../components/GovernedRulesTab";
+import MonitoringTab from "../../components/MonitoringTab";
+import GroundTruthDataset from "./GroundTruthDataset";
+import Evaluations from "./Evaluations";
+import { transformGraphData } from "../../utils/graphTransform";
 
 function useSortedItems(items, sorting) {
   return useMemo(() => {
     if (!sorting.sortingColumn) return items;
     const field = sorting.sortingColumn.sortingField;
     return [...items].sort((a, b) => {
-      const valA = (a[field] ?? '').toString().toLowerCase();
-      const valB = (b[field] ?? '').toString().toLowerCase();
+      const valA = (a[field] ?? "").toString().toLowerCase();
+      const valB = (b[field] ?? "").toString().toLowerCase();
       const cmp = valA < valB ? -1 : valA > valB ? 1 : 0;
       return sorting.isDescending ? -cmp : cmp;
     });
@@ -37,13 +49,13 @@ const GRAPH_HEIGHT_OFFSET = 390;
 
 function useGraphHeight() {
   const [height, setHeight] = useState(() =>
-    Math.max(400, window.innerHeight - GRAPH_HEIGHT_OFFSET)
+    Math.max(400, window.innerHeight - GRAPH_HEIGHT_OFFSET),
   );
   useEffect(() => {
     const onResize = () =>
       setHeight(Math.max(400, window.innerHeight - GRAPH_HEIGHT_OFFSET));
-    window.addEventListener('resize', onResize);
-    return () => window.removeEventListener('resize', onResize);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
   }, []);
   return height;
 }
@@ -51,7 +63,7 @@ function useGraphHeight() {
 export default function ViewKnowledgeGraph({ user }) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const id = searchParams.get('id');
+  const id = searchParams.get("id");
   const graphHeight = useGraphHeight();
 
   const [graphSummary, setGraphSummary] = useState(null);
@@ -65,13 +77,29 @@ export default function ViewKnowledgeGraph({ user }) {
   const [relationshipsSorting, setRelationshipsSorting] = useState({});
   const [propertiesSorting, setPropertiesSorting] = useState({});
 
-  const sortedEntities = useSortedItems(graphSummary?.entities ?? [], entitiesSorting);
-  const sortedRelationships = useSortedItems(graphSummary?.relationships ?? [], relationshipsSorting);
-  const sortedProperties = useSortedItems(graphSummary?.properties ?? [], propertiesSorting);
+  const sortedEntities = useSortedItems(
+    graphSummary?.entities ?? [],
+    entitiesSorting,
+  );
+  const sortedRelationships = useSortedItems(
+    graphSummary?.relationships ?? [],
+    relationshipsSorting,
+  );
+  const sortedProperties = useSortedItems(
+    graphSummary?.properties ?? [],
+    propertiesSorting,
+  );
+
+  // The layer's stored type ("VKG" | "Hybrid" | "SemanticRAG"), handed to the
+  // governance tabs so each can apply its own rules. This page is reachable for
+  // a Hybrid layer — BuildKnowledgeGraph navigates here unconditionally — so it
+  // must not assert VKG. Stays null until the config lands; the tabs treat an
+  // unknown type as "make no claim" rather than guessing.
+  const layerType = ontologyConfig?.type ?? null;
 
   useEffect(() => {
     if (!id) {
-      setError('No ID provided.');
+      setError("No ID provided.");
       setLoading(false);
       return;
     }
@@ -83,12 +111,13 @@ export default function ViewKnowledgeGraph({ user }) {
     setError(null);
 
     try {
-      const [summaryResult, statsResult, configResult, versionsResult] = await Promise.all([
-        neptuneAPI.getGraphSummary(id),
-        neptuneAPI.getGraphStats(id),
-        ontologyAPI.getOntologyConfig(id),
-        ontologyAPI.getOntologyVersions(id),
-      ]);
+      const [summaryResult, statsResult, configResult, versionsResult] =
+        await Promise.all([
+          neptuneAPI.getGraphSummary(id),
+          neptuneAPI.getGraphStats(id),
+          ontologyAPI.getOntologyConfig(id),
+          ontologyAPI.getOntologyVersions(id),
+        ]);
 
       if (summaryResult.success) setGraphSummary(summaryResult.data);
       if (statsResult.success) setGraphStats(statsResult.data);
@@ -99,10 +128,10 @@ export default function ViewKnowledgeGraph({ user }) {
       }
 
       if (!summaryResult.success && !statsResult.success) {
-        setError('Failed to load graph data');
+        setError("Failed to load graph data");
       }
     } catch (err) {
-      setError(err.message || 'An error occurred');
+      setError(err.message || "An error occurred");
     } finally {
       setLoading(false);
     }
@@ -116,20 +145,26 @@ export default function ViewKnowledgeGraph({ user }) {
         info={currentVersion && <Badge color="blue">{currentVersion}</Badge>}
         actions={
           <SpaceBetween direction="horizontal" size="xs">
-            <Button iconName="refresh" onClick={loadGraphData} loading={loading}>
+            <Button
+              iconName="refresh"
+              onClick={loadGraphData}
+              loading={loading}
+            >
               Refresh
             </Button>
             <Button
               variant="primary"
               iconName="search"
-              onClick={() => navigate('/query/ask')}
+              onClick={() => navigate("/query/ask")}
             >
               Start Querying
             </Button>
           </SpaceBetween>
         }
       >
-        {ontologyConfig?.name ? `Knowledge Graph — ${ontologyConfig.name}` : 'Knowledge Graph Overview'}
+        {ontologyConfig?.name
+          ? `Knowledge Graph — ${ontologyConfig.name}`
+          : "Knowledge Graph Overview"}
       </Header>
 
       {error && (
@@ -151,7 +186,7 @@ export default function ViewKnowledgeGraph({ user }) {
           {ontologyConfig && (
             <Container>
               <Box variant="awsui-key-label">Name</Box>
-              <Box variant="h2">{ontologyConfig.name ?? '—'}</Box>
+              <Box variant="h2">{ontologyConfig.name ?? "—"}</Box>
             </Container>
           )}
 
@@ -166,15 +201,21 @@ export default function ViewKnowledgeGraph({ user }) {
               <ColumnLayout columns={4} variant="text-grid">
                 <div>
                   <Box variant="awsui-key-label">Total Triples</Box>
-                  <Box variant="h2" fontSize="display-l">{graphStats.totalEdges || 0}</Box>
+                  <Box variant="h2" fontSize="display-l">
+                    {graphStats.totalEdges || 0}
+                  </Box>
                 </div>
                 <div>
                   <Box variant="awsui-key-label">Entities</Box>
-                  <Box variant="h2" fontSize="display-l">{graphStats.totalClasses || 0}</Box>
+                  <Box variant="h2" fontSize="display-l">
+                    {graphStats.totalClasses || 0}
+                  </Box>
                 </div>
                 <div>
                   <Box variant="awsui-key-label">Properties</Box>
-                  <Box variant="h2" fontSize="display-l">{(graphSummary?.properties ?? []).length || 0}</Box>
+                  <Box variant="h2" fontSize="display-l">
+                    {(graphSummary?.properties ?? []).length || 0}
+                  </Box>
                 </div>
                 <div>
                   <Box variant="awsui-key-label">Relationships</Box>
@@ -194,36 +235,48 @@ export default function ViewKnowledgeGraph({ user }) {
             <Tabs
               tabs={[
                 {
-                  label: 'Details',
-                  id: 'details',
+                  label: "Details",
+                  id: "details",
                   content: (
                     <Container>
                       <SpaceBetween size="l">
                         <div>
                           <Box variant="awsui-key-label">Name</Box>
-                          <Box variant="p">{ontologyConfig?.name ?? '—'}</Box>
+                          <Box variant="p">{ontologyConfig?.name ?? "—"}</Box>
                         </div>
                         <div>
                           <Box variant="awsui-key-label">Use Case Details</Box>
-                          {ontologyConfig?.useCasesDescription
-                            ? <Box variant="p">{ontologyConfig.useCasesDescription}</Box>
-                            : <Box color="text-status-inactive">No use case description provided</Box>
-                          }
+                          {ontologyConfig?.useCasesDescription ? (
+                            <Box variant="p">
+                              {ontologyConfig.useCasesDescription}
+                            </Box>
+                          ) : (
+                            <Box color="text-status-inactive">
+                              No use case description provided
+                            </Box>
+                          )}
                         </div>
                         <div>
-                          <Box variant="awsui-key-label">Data Source Description</Box>
-                          {ontologyConfig?.dataSourcesDescription
-                            ? <Box variant="p">{ontologyConfig.dataSourcesDescription}</Box>
-                            : <Box color="text-status-inactive">No data source description provided</Box>
-                          }
+                          <Box variant="awsui-key-label">
+                            Data Source Description
+                          </Box>
+                          {ontologyConfig?.dataSourcesDescription ? (
+                            <Box variant="p">
+                              {ontologyConfig.dataSourcesDescription}
+                            </Box>
+                          ) : (
+                            <Box color="text-status-inactive">
+                              No data source description provided
+                            </Box>
+                          )}
                         </div>
                       </SpaceBetween>
                     </Container>
                   ),
                 },
                 {
-                  label: 'Visual Graph',
-                  id: 'visual',
+                  label: "Visual Graph",
+                  id: "visual",
                   content: (
                     <Container>
                       <GraphVisualization
@@ -236,31 +289,35 @@ export default function ViewKnowledgeGraph({ user }) {
                 },
                 {
                   label: `Entities (${sortedEntities.length})`,
-                  id: 'entities',
+                  id: "entities",
                   content: (
                     <Container>
                       <Table
                         sortingColumn={entitiesSorting.sortingColumn}
                         sortingDescending={entitiesSorting.isDescending}
-                        onSortingChange={({ detail }) => setEntitiesSorting(detail)}
+                        onSortingChange={({ detail }) =>
+                          setEntitiesSorting(detail)
+                        }
                         columnDefinitions={[
                           {
-                            id: 'name',
-                            header: 'Entity Name',
-                            cell: (item) => <Badge color="blue">{item.name}</Badge>,
-                            sortingField: 'name',
+                            id: "name",
+                            header: "Entity Name",
+                            cell: (item) => (
+                              <Badge color="blue">{item.name}</Badge>
+                            ),
+                            sortingField: "name",
                           },
                           {
-                            id: 'type',
-                            header: 'Type',
-                            cell: (item) => item.type || '-',
-                            sortingField: 'type',
+                            id: "type",
+                            header: "Type",
+                            cell: (item) => item.type || "-",
+                            sortingField: "type",
                           },
                           {
-                            id: 'description',
-                            header: 'Description',
-                            cell: (item) => item.description || '-',
-                            sortingField: 'description',
+                            id: "description",
+                            header: "Description",
+                            cell: (item) => item.description || "-",
+                            sortingField: "description",
                           },
                         ]}
                         items={sortedEntities}
@@ -275,31 +332,35 @@ export default function ViewKnowledgeGraph({ user }) {
                 },
                 {
                   label: `Relationships (${sortedRelationships.length})`,
-                  id: 'relationships',
+                  id: "relationships",
                   content: (
                     <Container>
                       <Table
                         sortingColumn={relationshipsSorting.sortingColumn}
                         sortingDescending={relationshipsSorting.isDescending}
-                        onSortingChange={({ detail }) => setRelationshipsSorting(detail)}
+                        onSortingChange={({ detail }) =>
+                          setRelationshipsSorting(detail)
+                        }
                         columnDefinitions={[
                           {
-                            id: 'name',
-                            header: 'Relationship',
-                            cell: (item) => <Badge color="green">{item.name}</Badge>,
-                            sortingField: 'name',
+                            id: "name",
+                            header: "Relationship",
+                            cell: (item) => (
+                              <Badge color="green">{item.name}</Badge>
+                            ),
+                            sortingField: "name",
                           },
                           {
-                            id: 'from',
-                            header: 'From Entity',
-                            cell: (item) => item.from || '-',
-                            sortingField: 'from',
+                            id: "from",
+                            header: "From Entity",
+                            cell: (item) => item.from || "-",
+                            sortingField: "from",
                           },
                           {
-                            id: 'to',
-                            header: 'To Entity',
-                            cell: (item) => item.to || '-',
-                            sortingField: 'to',
+                            id: "to",
+                            header: "To Entity",
+                            cell: (item) => item.to || "-",
+                            sortingField: "to",
                           },
                         ]}
                         items={sortedRelationships}
@@ -314,37 +375,41 @@ export default function ViewKnowledgeGraph({ user }) {
                 },
                 {
                   label: `Properties (${sortedProperties.length})`,
-                  id: 'properties',
+                  id: "properties",
                   content: (
                     <Container>
                       <Table
                         sortingColumn={propertiesSorting.sortingColumn}
                         sortingDescending={propertiesSorting.isDescending}
-                        onSortingChange={({ detail }) => setPropertiesSorting(detail)}
+                        onSortingChange={({ detail }) =>
+                          setPropertiesSorting(detail)
+                        }
                         columnDefinitions={[
                           {
-                            id: 'name',
-                            header: 'Property Name',
-                            cell: (item) => item.name || '-',
-                            sortingField: 'name',
+                            id: "name",
+                            header: "Property Name",
+                            cell: (item) => item.name || "-",
+                            sortingField: "name",
                           },
                           {
-                            id: 'entity',
-                            header: 'Entity',
-                            cell: (item) => item.entity || '-',
-                            sortingField: 'entity',
+                            id: "entity",
+                            header: "Entity",
+                            cell: (item) => item.entity || "-",
+                            sortingField: "entity",
                           },
                           {
-                            id: 'dataType',
-                            header: 'Data Type',
-                            cell: (item) => <Badge>{item.dataType || 'string'}</Badge>,
-                            sortingField: 'dataType',
+                            id: "dataType",
+                            header: "Data Type",
+                            cell: (item) => (
+                              <Badge>{item.dataType || "string"}</Badge>
+                            ),
+                            sortingField: "dataType",
                           },
                           {
-                            id: 'description',
-                            header: 'Description',
-                            cell: (item) => item.description || '-',
-                            sortingField: 'description',
+                            id: "description",
+                            header: "Description",
+                            cell: (item) => item.description || "-",
+                            sortingField: "description",
                           },
                         ]}
                         items={sortedProperties}
@@ -358,12 +423,148 @@ export default function ViewKnowledgeGraph({ user }) {
                   ),
                 },
                 {
-                  label: 'Metadata',
-                  id: 'edit',
+                  label: "Metadata",
+                  id: "edit",
                   content: id ? (
-                    <OntologyEditor id={id} />
+                    <SpaceBetween size="l">
+                      <Container>
+                        <DeltaPreview
+                          totalTables={ontologyConfig?.dataSources?.length ?? 0}
+                          onCompute={async () => {
+                            const res = await computeOntologyDelta(id);
+                            return res.data;
+                          }}
+                          onRebuild={async (scope, plan) => {
+                            await ontologyAPI.buildOntology(id, {
+                              scope,
+                              targetTables:
+                                scope === "delta" ? plan.rebuildSet : undefined,
+                              removedTables:
+                                scope === "delta" ? plan.removed : undefined,
+                            });
+                            loadGraphData();
+                          }}
+                        />
+                      </Container>
+                      <OntologyEditor id={id} />
+                    </SpaceBetween>
                   ) : (
-                    <Box color="text-status-inactive" padding="l" textAlign="center">
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Governed Metrics",
+                  id: "governed-metrics",
+                  content: id ? (
+                    <GovernedMetricsTab ontologyId={id} layerType={layerType} />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Governed Rules",
+                  id: "governed-rules",
+                  content: id ? (
+                    // currentUser is recorded on every threshold/rule approval —
+                    // an approval with no named human in it is not governance.
+                    <GovernedRulesTab
+                      ontologyId={id}
+                      layerType={layerType}
+                      currentUser={user?.email || user?.username}
+                    />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Lessons learned",
+                  id: "lessons",
+                  content: id ? (
+                    <LessonsLearnedTab ontologyId={id} />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Feedback",
+                  id: "feedback",
+                  content: id ? (
+                    <FeedbackTab ontologyId={id} />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Ground Truth",
+                  id: "ground-truth",
+                  content: id ? (
+                    <GroundTruthDataset id={id} />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Evaluations",
+                  id: "evaluations",
+                  content: id ? (
+                    <Evaluations id={id} />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
+                      No semantic layer selected
+                    </Box>
+                  ),
+                },
+                {
+                  label: "Monitoring",
+                  id: "monitoring",
+                  content: id ? (
+                    <MonitoringTab ontologyId={id} />
+                  ) : (
+                    <Box
+                      color="text-status-inactive"
+                      padding="l"
+                      textAlign="center"
+                    >
                       No semantic layer selected
                     </Box>
                   ),
@@ -373,8 +574,8 @@ export default function ViewKnowledgeGraph({ user }) {
           )}
 
           <Alert type="success" header="Knowledge Graph Ready">
-            Your semantic layer is now fully configured and ready to use.
-            You can start asking natural language questions about your data.
+            Your semantic layer is now fully configured and ready to use. You
+            can start asking natural language questions about your data.
           </Alert>
         </SpaceBetween>
       )}

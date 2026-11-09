@@ -1,12 +1,9 @@
 """
 Metadata API Endpoints
 
-Provides REST API endpoints for metadata enrichment and querying:
-- Start metadata enrichment job
-- Get enrichment job status
-- Submit metadata query
-- Get query status
-- Get query results
+Provides REST API endpoints for metadata enrichment and table KB documents.
+Natural-language metadata querying runs over the streaming AG-UI chat gateway —
+there is no async submit/status/result surface here.
 """
 
 import logging
@@ -31,15 +28,12 @@ class MetadataEnrichRequest(BaseModel):
     id: str  # ontology config ID — backend reads dataSources from DynamoDB
     targetTables: Optional[List[str]] = None   # e.g. ["database.table"] — if set, only re-enrich these
     annotations: Optional[List[Dict[str, str]]] = None  # [{target, instruction}]
+    scope: Optional[str] = "full"          # "full" | "delta"
+    removedTables: Optional[List[str]] = None  # tables whose artifacts to clean up before a delta rebuild
 
 
 class ReviseMetadataRequest(BaseModel):
     annotations: List[Dict[str, str]]
-
-
-class MetadataQueryRequest(BaseModel):
-    question: str
-    id: str  # ontology config ID — backend looks up dataSources from DynamoDB
 
 
 # ============================================================================
@@ -72,6 +66,12 @@ async def enrich_metadata(request: MetadataEnrichRequest):
     try:
         logger.info(f"Starting async metadata enrichment for ontology: {request.id}")
 
+        # For a delta rebuild, remove artifacts for deleted tables BEFORE building.
+        # Single cleanup call site for the RAG path.
+        if request.scope == "delta" and request.removedTables:
+            metadata_service.cleanup_removed_for_plan(
+                request.id, {"removed": request.removedTables})
+
         result = metadata_service.start_metadata_enrichment(
             id=request.id,
             target_tables=request.targetTables,
@@ -86,6 +86,18 @@ async def enrich_metadata(request: MetadataEnrichRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.warning(f"Error starting metadata enrichment: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delta/{id}")
+async def compute_delta(id: str):
+    """Compute (do not run) the delta plan for a Semantic-RAG layer."""
+    try:
+        return JSONResponse(content=metadata_service.compute_delta_plan(id))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.warning(f"delta compute failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -140,102 +152,6 @@ async def revise_metadata(id: str, version_id: str, body: ReviseMetadataRequest)
 
 
 # ============================================================================
-# Metadata Query Endpoints
-# ============================================================================
-
-@app.post("/query/submit", status_code=202)
-async def submit_metadata_query(request: MetadataQueryRequest):
-    """
-    Submit a natural language query about metadata (ASYNC)
-
-    This endpoint:
-    1. Converts natural language query into metadata search criteria
-    2. Triggers asynchronous query processing via Bedrock agent
-    3. Returns immediately with query ID and status 'processing'
-
-    The actual query process (executed asynchronously):
-    - Uses Bedrock agent to interpret natural language question
-    - Searches metadata catalog for matching tables/columns
-    - Generates structured result set
-
-    Use the /query/status/{query_id} endpoint to poll for completion status.
-    Use the /query/result/{query_id} endpoint to retrieve results once ready.
-
-    Args:
-        request: Metadata query request with question and database name
-
-    Returns:
-        Immediate response with query ID and status 'processing'
-    """
-    try:
-        logger.info(f"Starting async metadata query for ontology: {request.id}")
-
-        result = metadata_service.submit_metadata_query(
-            question=request.question,
-            id=request.id,
-        )
-
-        logger.info(f"Metadata query submitted with query_id: {result.get('query_id')}")
-        return JSONResponse(content=result, status_code=202)  # 202 Accepted
-
-    except Exception as e:
-        logger.warning(f"Error submitting metadata query: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/query/status/{query_id}")
-async def get_metadata_query_status(query_id: str):
-    """
-    Get the status of a metadata query
-
-    Args:
-        query_id: Unique identifier for the query
-
-    Returns:
-        Query status (SUBMITTED, PROCESSING, SUCCEEDED, FAILED)
-    """
-    try:
-        status = metadata_service.get_metadata_query_status(query_id)
-
-        if status.get('status') == 'NOT_FOUND':
-            raise HTTPException(status_code=404, detail="Metadata query not found")
-
-        return JSONResponse(content=status)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"Error getting metadata query status: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/query/result/{query_id}")
-async def get_metadata_query_result(query_id: str):
-    """
-    Get the result of a completed metadata query
-
-    Args:
-        query_id: Unique identifier for the query
-
-    Returns:
-        Query results including matching tables/columns and metadata
-    """
-    try:
-        result = metadata_service.get_metadata_query_result(query_id)
-
-        if result.get('status') == 'NOT_FOUND':
-            raise HTTPException(status_code=404, detail="Query result not found")
-
-        return JSONResponse(content=result)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"Error getting metadata query result: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ============================================================================
 # Knowledge Base Table Metadata
 # ============================================================================
 
@@ -243,17 +159,29 @@ async def get_metadata_query_result(query_id: str):
 async def get_table_kb_metadata(
     database_name: str,
     table_name: str,
-    catalog_id: Optional[str] = None,
+    catalog_id: str,
+    semantic_layer_id: str,
+    semantic_layer_version: str,
 ):
     """
     Return the AI-enriched metadata for a single table from the S3 document
     written by the metadata agent (source of truth for the Bedrock Knowledge Base).
 
+    The metadata agent writes documents under
+    ``metadata/{semantic_layer_id}/{semantic_layer_version}/{catalog_id}/{database_name}/{table_name}.md``,
+    so all four scoping fields are required to locate the document.
+
     Returns structured JSON: description, columns [{name, type, description}].
     404 when the document has not been generated yet.
     """
     try:
-        result = metadata_service.get_table_kb_metadata(database_name, table_name, catalog_id)
+        result = metadata_service.get_table_kb_metadata(
+            database_name=database_name,
+            table_name=table_name,
+            catalog_id=catalog_id,
+            semantic_layer_id=semantic_layer_id,
+            semantic_layer_version=semantic_layer_version,
+        )
         if not result.get('success'):
             raise HTTPException(status_code=404, detail=result.get('error', 'Not found'))
         return JSONResponse(content=result)

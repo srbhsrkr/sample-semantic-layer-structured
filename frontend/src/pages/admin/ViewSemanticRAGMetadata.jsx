@@ -1,24 +1,68 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import React, { useState, useEffect, useMemo, useCallback } from "react";
+import { useNavigate, useParams } from "react-router-dom";
 import {
-  SpaceBetween, Header, Container, Button, ColumnLayout,
-  Box, StatusIndicator, Alert, Tabs, Table, Badge,
-  ExpandableSection, Modal, Textarea, FormField,
-} from '@cloudscape-design/components';
+  SpaceBetween,
+  Header,
+  Container,
+  Button,
+  ColumnLayout,
+  Box,
+  StatusIndicator,
+  Alert,
+  Tabs,
+  Table,
+  Badge,
+  ExpandableSection,
+  Modal,
+  Textarea,
+  FormField,
+} from "@cloudscape-design/components";
 import {
-  ontologyAPI, getMetadataEnrichmentStatus, startMetadataEnrichment, reviseMetadata,
-  dataSourceAPI, getTableKBMetadata,
-} from '../../services/api';
-
+  ontologyAPI,
+  getMetadataEnrichmentStatus,
+  startMetadataEnrichment,
+  reviseMetadata,
+  dataSourceAPI,
+  getTableKBMetadata,
+  computeMetadataDelta,
+} from "../../services/api";
+import DeltaPreview from "../../components/DeltaPreview";
+import LessonsLearnedTab from "../../components/LessonsLearnedTab";
+import FeedbackTab from "../../components/FeedbackTab";
+import GovernedMetricsTab from "../../components/GovernedMetricsTab";
+import GovernedRulesTab from "../../components/GovernedRulesTab";
+import MonitoringTab from "../../components/MonitoringTab";
+import GroundTruthDataset from "./GroundTruthDataset";
+import Evaluations from "./Evaluations";
+import {
+  RULES_UNSUPPORTED_MESSAGE,
+  rulesUnsupportedFor,
+} from "../../utils/layerCapabilities";
 
 // ─── Glue catalog expandable card (Data Sources tab) ─────────────────────────
 
 const GLUE_COL_DEFS = [
-  { id: 'name', header: 'Column', cell: c => <Box fontWeight="bold">{c.name}</Box> },
-  { id: 'type', header: 'Type', cell: c => <Box variant="code" fontSize="body-s">{c.type}</Box>, width: 180 },
-  { id: 'desc', header: 'Description', cell: c => c.comment
-      ? c.comment
-      : <Box color="text-status-inactive">—</Box> },
+  {
+    id: "name",
+    header: "Column",
+    cell: (c) => <Box fontWeight="bold">{c.name}</Box>,
+  },
+  {
+    id: "type",
+    header: "Type",
+    cell: (c) => (
+      <Box variant="code" fontSize="body-s">
+        {c.type}
+      </Box>
+    ),
+    width: 180,
+  },
+  {
+    id: "desc",
+    header: "Description",
+    cell: (c) =>
+      c.comment ? c.comment : <Box color="text-status-inactive">—</Box>,
+  },
 ];
 
 function GlueTableCard({ ds }) {
@@ -32,14 +76,20 @@ function GlueTableCard({ ds }) {
     if (detail.expanded && !meta && !loading) {
       setLoading(true);
       setFetchError(null);
-      const r = await dataSourceAPI.getTableMetadata(ds.databaseName, ds.tableName, ds.catalogId);
+      const r = await dataSourceAPI.getTableMetadata(
+        ds.databaseName,
+        ds.tableName,
+        ds.catalogId,
+      );
       setLoading(false);
       if (r.success) setMeta(r.data);
-      else setFetchError(r.error || 'Failed to load schema');
+      else setFetchError(r.error || "Failed to load schema");
     }
   };
 
-  const columns = meta ? [...(meta.columns || []), ...(meta.partitionKeys || [])] : [];
+  const columns = meta
+    ? [...(meta.columns || []), ...(meta.partitionKeys || [])]
+    : [];
 
   return (
     <ExpandableSection
@@ -54,18 +104,18 @@ function GlueTableCard({ ds }) {
       }
       headerDescription={
         <Box variant="code" fontSize="body-s" color="text-status-inactive">
-          {ds.catalogId || 'AWSDataCatalog'}
+          {ds.catalogId || "AWSDataCatalog"}
         </Box>
       }
     >
       {loading && (
         <Box padding="m">
-          <StatusIndicator type="loading">Loading schema from Glue…</StatusIndicator>
+          <StatusIndicator type="loading">
+            Loading schema from Glue…
+          </StatusIndicator>
         </Box>
       )}
-      {fetchError && (
-        <Alert type="error">{fetchError}</Alert>
-      )}
+      {fetchError && <Alert type="error">{fetchError}</Alert>}
       {meta && !loading && (
         <SpaceBetween size="m">
           {meta.description ? (
@@ -74,14 +124,18 @@ function GlueTableCard({ ds }) {
               <Box variant="p">{meta.description}</Box>
             </Box>
           ) : (
-            <Box color="text-status-inactive" fontSize="body-s">No table description in catalog</Box>
+            <Box color="text-status-inactive" fontSize="body-s">
+              No table description in catalog
+            </Box>
           )}
           <Table
             variant="embedded"
             columnDefinitions={GLUE_COL_DEFS}
             items={columns}
             empty={
-              <Box textAlign="center" color="text-status-inactive">No columns found</Box>
+              <Box textAlign="center" color="text-status-inactive">
+                No columns found
+              </Box>
             }
           />
         </SpaceBetween>
@@ -93,7 +147,15 @@ function GlueTableCard({ ds }) {
 // ─── Knowledge Base expandable card (Metadata tab) ───────────────────────────
 
 // tableAnnotations: [{ id, tableKey, target, instruction }] filtered for this table
-function KBTableCard({ ds, tableAnnotations, onAddAnnotation, onRemoveAnnotation, versionKey }) {
+function KBTableCard({
+  ds,
+  tableAnnotations,
+  onAddAnnotation,
+  onRemoveAnnotation,
+  versionKey,
+  semanticLayerId,
+  semanticLayerVersion,
+}) {
   const [expanded, setExpanded] = useState(false);
   const [meta, setMeta] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -101,74 +163,107 @@ function KBTableCard({ ds, tableAnnotations, onAddAnnotation, onRemoveAnnotation
   const [fetchError, setFetchError] = useState(null);
 
   // Modal state (stays local)
-  const [pendingTarget, setPendingTarget] = useState('');
+  const [pendingTarget, setPendingTarget] = useState("");
   const [showModal, setShowModal] = useState(false);
-  const [comment, setComment] = useState('');
+  const [comment, setComment] = useState("");
 
-  // Reset when a new version has been created
+  // Reset when a new version has been created (versionKey is bumped after revise)
+  // or when the active semanticLayerVersion changes (e.g. version selector flips).
   useEffect(() => {
     setMeta(null);
     setNotFound(false);
     setExpanded(false);
-  }, [versionKey]);
+  }, [versionKey, semanticLayerVersion]);
 
   const onToggle = async ({ detail }) => {
     setExpanded(detail.expanded);
     if (detail.expanded && !meta && !loading && !notFound) {
       setLoading(true);
       setFetchError(null);
-      const r = await getTableKBMetadata(ds.databaseName, ds.tableName, ds.catalogId);
+      const r = await getTableKBMetadata(
+        ds.databaseName,
+        ds.tableName,
+        ds.catalogId,
+        semanticLayerId,
+        semanticLayerVersion,
+      );
       setLoading(false);
       if (r.success) setMeta(r.data);
-      else if (r.error?.includes('not yet generated') || r.details?.detail?.includes('not yet generated')) setNotFound(true);
-      else setFetchError(r.error || 'Failed to load metadata');
+      else if (
+        r.error?.includes("not yet generated") ||
+        r.details?.detail?.includes("not yet generated")
+      )
+        setNotFound(true);
+      else setFetchError(r.error || "Failed to load metadata");
     }
   };
 
   const openAnnotate = (target) => {
     setPendingTarget(target);
     setShowModal(true);
-    setComment('');
+    setComment("");
   };
 
   const closeModal = () => {
     setShowModal(false);
-    setPendingTarget('');
-    setComment('');
+    setPendingTarget("");
+    setComment("");
   };
 
   const confirmAnnotation = () => {
-    onAddAnnotation({ id: Date.now().toString(), target: pendingTarget, instruction: comment });
+    onAddAnnotation({
+      id: Date.now().toString(),
+      target: pendingTarget,
+      instruction: comment,
+    });
     closeModal();
   };
 
-  const annotatedTargets = new Set(tableAnnotations.map(a => a.target));
+  const annotatedTargets = new Set(tableAnnotations.map((a) => a.target));
 
   const kbColDefs = [
-    { id: 'name', header: 'Column', cell: c => <Box fontWeight="bold">{c.name}</Box> },
-    { id: 'type', header: 'Type', cell: c => <Box variant="code" fontSize="body-s">{c.type}</Box>, width: 180 },
     {
-      id: 'desc',
-      header: 'Description',
-      cell: c => c.description ? c.description : <Box color="text-status-inactive">—</Box>,
+      id: "name",
+      header: "Column",
+      cell: (c) => <Box fontWeight="bold">{c.name}</Box>,
     },
     {
-      id: 'annotate',
-      header: '',
+      id: "type",
+      header: "Type",
+      cell: (c) => (
+        <Box variant="code" fontSize="body-s">
+          {c.type}
+        </Box>
+      ),
+      width: 180,
+    },
+    {
+      id: "desc",
+      header: "Description",
+      cell: (c) =>
+        c.description ? (
+          c.description
+        ) : (
+          <Box color="text-status-inactive">—</Box>
+        ),
+    },
+    {
+      id: "annotate",
+      header: "",
       width: 150,
       minWidth: 150,
-      cell: c => {
+      cell: (c) => {
         const key = `column:${c.name}`;
         const isAnnotated = annotatedTargets.has(key);
         return (
-          <div style={{ whiteSpace: 'nowrap' }}>
+          <div style={{ whiteSpace: "nowrap" }}>
             <Button
-              variant={isAnnotated ? 'normal' : 'inline-link'}
-              iconName={isAnnotated ? 'check' : 'add-plus'}
+              variant={isAnnotated ? "normal" : "inline-link"}
+              iconName={isAnnotated ? "check" : "add-plus"}
               size="small"
               onClick={() => openAnnotate(key)}
             >
-              {isAnnotated ? 'Annotated' : 'Annotate'}
+              {isAnnotated ? "Annotated" : "Annotate"}
             </Button>
           </div>
         );
@@ -189,54 +284,96 @@ function KBTableCard({ ds, tableAnnotations, onAddAnnotation, onRemoveAnnotation
             <Badge color="blue">{ds.databaseName}</Badge>
             <Box fontWeight="bold">{ds.tableName}</Box>
             {tableAnnotationCount > 0 && (
-              <Badge color="severity-medium">{tableAnnotationCount} pending</Badge>
+              <Badge color="severity-medium">
+                {tableAnnotationCount} pending
+              </Badge>
             )}
           </SpaceBetween>
         }
         headerDescription={
           <Box variant="code" fontSize="body-s" color="text-status-inactive">
-            {ds.catalogId || 'AWSDataCatalog'}
+            {ds.catalogId || "AWSDataCatalog"}
           </Box>
         }
       >
         {loading && (
           <Box padding="m">
-            <StatusIndicator type="loading">Loading Knowledge Base metadata…</StatusIndicator>
+            <StatusIndicator type="loading">
+              Loading Knowledge Base metadata…
+            </StatusIndicator>
           </Box>
         )}
         {notFound && (
           <Alert type="info">
-            Metadata not yet generated for this table. Run enrichment to populate the Knowledge Base.
+            Metadata not yet generated for this table. Run enrichment to
+            populate the Knowledge Base.
           </Alert>
         )}
-        {fetchError && (
-          <Alert type="error">{fetchError}</Alert>
-        )}
+        {fetchError && <Alert type="error">{fetchError}</Alert>}
         {meta && !loading && (
           <SpaceBetween size="m">
             <div>
-              <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+              <SpaceBetween
+                direction="horizontal"
+                size="xs"
+                alignItems="center"
+              >
                 <Box variant="awsui-key-label">Table Description</Box>
                 <Button
-                  variant={annotatedTargets.has('table_description') ? 'normal' : 'inline-link'}
-                  iconName={annotatedTargets.has('table_description') ? 'check' : 'add-plus'}
+                  variant={
+                    annotatedTargets.has("table_description")
+                      ? "normal"
+                      : "inline-link"
+                  }
+                  iconName={
+                    annotatedTargets.has("table_description")
+                      ? "check"
+                      : "add-plus"
+                  }
                   size="small"
-                  onClick={() => openAnnotate('table_description')}
+                  onClick={() => openAnnotate("table_description")}
                 >
-                  {annotatedTargets.has('table_description') ? 'Annotated' : 'Annotate'}
+                  {annotatedTargets.has("table_description")
+                    ? "Annotated"
+                    : "Annotate"}
                 </Button>
               </SpaceBetween>
-              {meta.description
-                ? <Box variant="p">{meta.description}</Box>
-                : <Box color="text-status-inactive" fontSize="body-s">No description in Knowledge Base</Box>
-              }
+              {meta.description ? (
+                <Box variant="p">{meta.description}</Box>
+              ) : (
+                <Box color="text-status-inactive" fontSize="body-s">
+                  No description in Knowledge Base
+                </Box>
+              )}
             </div>
+            {/* Full curated KB document: render every additional markdown
+                section (Business Purpose, Business Concepts, Reference Tables,
+                Common Query Patterns, ACORD Source Path, Notes, …). Overview is
+                already shown above as the Table Description, and Columns is the
+                table below, so both are skipped here. */}
+            {(meta.sections || [])
+              .filter(
+                (s) =>
+                  !/^overview$/i.test(s.title) &&
+                  !/^columns$/i.test(s.title) &&
+                  s.body,
+              )
+              .map((s) => (
+                <div key={s.title}>
+                  <Box variant="awsui-key-label">{s.title}</Box>
+                  <Box variant="p" fontSize="body-s">
+                    <span style={{ whiteSpace: "pre-wrap" }}>{s.body}</span>
+                  </Box>
+                </div>
+              ))}
             <Table
               variant="embedded"
               columnDefinitions={kbColDefs}
               items={meta.columns || []}
               empty={
-                <Box textAlign="center" color="text-status-inactive">No columns found</Box>
+                <Box textAlign="center" color="text-status-inactive">
+                  No columns found
+                </Box>
               }
             />
           </SpaceBetween>
@@ -250,8 +387,14 @@ function KBTableCard({ ds, tableAnnotations, onAddAnnotation, onRemoveAnnotation
         onDismiss={closeModal}
         footer={
           <SpaceBetween direction="horizontal" size="xs">
-            <Button variant="link" onClick={closeModal}>Cancel</Button>
-            <Button variant="primary" disabled={!comment.trim()} onClick={confirmAnnotation}>
+            <Button variant="link" onClick={closeModal}>
+              Cancel
+            </Button>
+            <Button
+              variant="primary"
+              disabled={!comment.trim()}
+              onClick={confirmAnnotation}
+            >
               Confirm
             </Button>
           </SpaceBetween>
@@ -272,7 +415,18 @@ function KBTableCard({ ds, tableAnnotations, onAddAnnotation, onRemoveAnnotation
 
 // ─── Main component ──────────────────────────────────────────────────────────
 
-export default function ViewSemanticRAGMetadata() {
+/**
+ * Detail page for every completed layer that is NOT a VKG.
+ *
+ * `AdminDashboard.getActionButton` sends only `type === "VKG"` to
+ * `/admin/view-graph`, so a **Hybrid** layer lands here too — which is why the
+ * governance tabs below must read the layer's stored type rather than assuming
+ * Semantic RAG.
+ *
+ * @param {object} [user] Signed-in Cognito user; its identity is recorded on
+ *                        every governed-rule approval.
+ */
+export default function ViewSemanticRAGMetadata({ user }) {
   const { id } = useParams();
   const navigate = useNavigate();
 
@@ -289,8 +443,15 @@ export default function ViewSemanticRAGMetadata() {
   const [versionKey, setVersionKey] = useState(0);
 
   const uniqueDatabases = useMemo(
-    () => [...new Set((config?.dataSources || []).map(ds => ds.databaseName).filter(Boolean))].length,
-    [config]
+    () =>
+      [
+        ...new Set(
+          (config?.dataSources || [])
+            .map((ds) => ds.databaseName)
+            .filter(Boolean),
+        ),
+      ].length,
+    [config],
   );
 
   const loadData = useCallback(async () => {
@@ -319,16 +480,18 @@ export default function ViewSemanticRAGMetadata() {
     }
   }, [id]);
 
-  useEffect(() => { loadData(); }, [loadData]);
+  useEffect(() => {
+    loadData();
+  }, [loadData]);
 
   // ── Global annotation helpers ──
 
   const handleAddAnnotation = useCallback((tableKey, annotation) => {
-    setAnnotations(prev => [...prev, { ...annotation, tableKey }]);
+    setAnnotations((prev) => [...prev, { ...annotation, tableKey }]);
   }, []);
 
   const handleRemoveAnnotation = useCallback((annotationId) => {
-    setAnnotations(prev => prev.filter(a => a.id !== annotationId));
+    setAnnotations((prev) => prev.filter((a) => a.id !== annotationId));
   }, []);
 
   // ── Create New Version (all annotations across all tables) ──
@@ -339,7 +502,11 @@ export default function ViewSemanticRAGMetadata() {
     const result = await reviseMetadata(
       id,
       currentVersion,
-      annotations.map(({ target, instruction, tableKey }) => ({ tableKey, target, instruction })),
+      annotations.map(({ target, instruction, tableKey }) => ({
+        tableKey,
+        target,
+        instruction,
+      })),
     );
     if (!result.success) {
       setError(result.error);
@@ -352,19 +519,19 @@ export default function ViewSemanticRAGMetadata() {
       const status = await getMetadataEnrichmentStatus(id);
       if (status.success) setEnrichmentStatus(status.data);
       const st = status?.data?.status;
-      if (st === 'completed' || st === 'failed' || attempts > 60) {
+      if (st === "completed" || st === "failed" || attempts > 60) {
         clearInterval(poll);
         setReenriching(false);
-        if (st === 'completed') {
+        if (st === "completed") {
           setAnnotations([]);
-          setVersionKey(k => k + 1);
+          setVersionKey((k) => k + 1);
           const versResult = await ontologyAPI.getOntologyVersions(id);
           if (versResult.success) {
             const versions = versResult.data?.versions ?? [];
             if (versions.length > 0) setCurrentVersion(versions[0].version);
           }
         } else {
-          setError('Re-enrichment failed. Check status for details.');
+          setError("Re-enrichment failed. Check status for details.");
         }
       }
     }, 5000);
@@ -373,7 +540,7 @@ export default function ViewSemanticRAGMetadata() {
   // ── Render ──
 
   const totalTables = enrichmentStatus?.totalTables || 0;
-  const status = enrichmentStatus?.status || 'unknown';
+  const status = enrichmentStatus?.status || "unknown";
 
   return (
     <SpaceBetween size="l">
@@ -386,13 +553,17 @@ export default function ViewSemanticRAGMetadata() {
             <Button iconName="refresh" onClick={loadData} loading={loading}>
               Refresh
             </Button>
-            <Button variant="primary" iconName="search" onClick={() => navigate('/query')}>
+            <Button
+              variant="primary"
+              iconName="search"
+              onClick={() => navigate("/query")}
+            >
               Query this data
             </Button>
           </SpaceBetween>
         }
       >
-        Semantic Metadata — {config?.name ?? '…'}
+        Semantic Metadata — {config?.name ?? "…"}
       </Header>
 
       {error && (
@@ -404,7 +575,9 @@ export default function ViewSemanticRAGMetadata() {
       {loading ? (
         <Container>
           <Box textAlign="center" padding="l">
-            <StatusIndicator type="loading">Loading semantic metadata…</StatusIndicator>
+            <StatusIndicator type="loading">
+              Loading semantic metadata…
+            </StatusIndicator>
           </Box>
         </Container>
       ) : (
@@ -413,14 +586,21 @@ export default function ViewSemanticRAGMetadata() {
           {config && (
             <Container>
               <Box variant="awsui-key-label">Name</Box>
-              <Box variant="h2">{config.name ?? '—'}</Box>
+              <Box variant="h2">{config.name ?? "—"}</Box>
             </Container>
           )}
 
           {/* ── Stats ── */}
           <Container
             header={
-              <Header variant="h2" info={<Badge color={status === 'completed' ? 'green' : 'grey'}>{status}</Badge>}>
+              <Header
+                variant="h2"
+                info={
+                  <Badge color={status === "completed" ? "green" : "grey"}>
+                    {status}
+                  </Badge>
+                }
+              >
                 Enrichment Summary
               </Header>
             }
@@ -428,11 +608,15 @@ export default function ViewSemanticRAGMetadata() {
             <ColumnLayout columns={2} variant="text-grid">
               <div>
                 <Box variant="awsui-key-label">Databases enriched</Box>
-                <Box variant="h2" fontSize="display-l">{uniqueDatabases}</Box>
+                <Box variant="h2" fontSize="display-l">
+                  {uniqueDatabases}
+                </Box>
               </div>
               <div>
                 <Box variant="awsui-key-label">Tables enriched</Box>
-                <Box variant="h2" fontSize="display-l">{totalTables}</Box>
+                <Box variant="h2" fontSize="display-l">
+                  {totalTables}
+                </Box>
               </div>
             </ColumnLayout>
           </Container>
@@ -441,28 +625,36 @@ export default function ViewSemanticRAGMetadata() {
           <Tabs
             tabs={[
               {
-                label: 'Details',
-                id: 'details',
+                label: "Details",
+                id: "details",
                 content: (
                   <Container>
                     <SpaceBetween size="l">
                       <div>
                         <Box variant="awsui-key-label">Name</Box>
-                        <Box variant="p">{config?.name ?? '—'}</Box>
+                        <Box variant="p">{config?.name ?? "—"}</Box>
                       </div>
                       <div>
                         <Box variant="awsui-key-label">Use Case Details</Box>
-                        {config?.useCasesDescription
-                          ? <Box variant="p">{config.useCasesDescription}</Box>
-                          : <Box color="text-status-inactive">No use case description provided</Box>
-                        }
+                        {config?.useCasesDescription ? (
+                          <Box variant="p">{config.useCasesDescription}</Box>
+                        ) : (
+                          <Box color="text-status-inactive">
+                            No use case description provided
+                          </Box>
+                        )}
                       </div>
                       <div>
-                        <Box variant="awsui-key-label">Data Source Description</Box>
-                        {config?.dataSourcesDescription
-                          ? <Box variant="p">{config.dataSourcesDescription}</Box>
-                          : <Box color="text-status-inactive">No data source description provided</Box>
-                        }
+                        <Box variant="awsui-key-label">
+                          Data Source Description
+                        </Box>
+                        {config?.dataSourcesDescription ? (
+                          <Box variant="p">{config.dataSourcesDescription}</Box>
+                        ) : (
+                          <Box color="text-status-inactive">
+                            No data source description provided
+                          </Box>
+                        )}
                       </div>
                     </SpaceBetween>
                   </Container>
@@ -470,26 +662,52 @@ export default function ViewSemanticRAGMetadata() {
               },
               {
                 label: `Data Sources (${config?.dataSources?.length ?? 0})`,
-                id: 'datasources',
+                id: "datasources",
                 content: (
                   <SpaceBetween size="s">
+                    <Container>
+                      <DeltaPreview
+                        totalTables={config?.dataSources?.length ?? 0}
+                        onCompute={async () => {
+                          const res = await computeMetadataDelta(id);
+                          return res.data;
+                        }}
+                        onRebuild={async (scope, plan) => {
+                          await startMetadataEnrichment(id, {
+                            scope,
+                            targetTables:
+                              scope === "delta" ? plan.rebuildSet : undefined,
+                            removedTables:
+                              scope === "delta" ? plan.removed : undefined,
+                          });
+                          loadData();
+                        }}
+                      />
+                    </Container>
                     {(config?.dataSources ?? []).length === 0 ? (
                       <Container>
-                        <Box textAlign="center" color="text-status-inactive" padding="l">
+                        <Box
+                          textAlign="center"
+                          color="text-status-inactive"
+                          padding="l"
+                        >
                           No data sources configured
                         </Box>
                       </Container>
                     ) : (
                       (config?.dataSources ?? []).map((ds) => (
-                        <GlueTableCard key={`${ds.databaseName}.${ds.tableName}`} ds={ds} />
+                        <GlueTableCard
+                          key={`${ds.databaseName}.${ds.tableName}`}
+                          ds={ds}
+                        />
                       ))
                     )}
                   </SpaceBetween>
                 ),
               },
               {
-                label: 'Metadata',
-                id: 'metadata',
+                label: "Metadata",
+                id: "metadata",
                 content: (
                   <SpaceBetween size="m">
                     {/* ── Pending annotations + Create New Version ── */}
@@ -513,18 +731,33 @@ export default function ViewSemanticRAGMetadata() {
                         }
                       >
                         <SpaceBetween size="xs">
-                          {annotations.map(a => (
-                            <div key={a.id} style={{
-                              display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
-                              border: '1px solid #d5dbdb', borderRadius: 8,
-                              background: '#f8f8f8', padding: '8px 12px',
-                            }}>
+                          {annotations.map((a) => (
+                            <div
+                              key={a.id}
+                              style={{
+                                display: "flex",
+                                justifyContent: "space-between",
+                                alignItems: "flex-start",
+                                border: "1px solid #d5dbdb",
+                                borderRadius: 8,
+                                background: "#f8f8f8",
+                                padding: "8px 12px",
+                              }}
+                            >
                               <SpaceBetween size="xxs">
-                                <SpaceBetween direction="horizontal" size="xs" alignItems="center">
+                                <SpaceBetween
+                                  direction="horizontal"
+                                  size="xs"
+                                  alignItems="center"
+                                >
                                   <Badge color="blue">{a.tableKey}</Badge>
-                                  <Box variant="code" fontSize="body-s">{a.target}</Box>
+                                  <Box variant="code" fontSize="body-s">
+                                    {a.target}
+                                  </Box>
                                 </SpaceBetween>
-                                <Box variant="p" fontSize="body-s">{a.instruction}</Box>
+                                <Box variant="p" fontSize="body-s">
+                                  {a.instruction}
+                                </Box>
                               </SpaceBetween>
                               <Button
                                 variant="icon"
@@ -542,7 +775,11 @@ export default function ViewSemanticRAGMetadata() {
                     <SpaceBetween size="s">
                       {(config?.dataSources ?? []).length === 0 ? (
                         <Container>
-                          <Box textAlign="center" color="text-status-inactive" padding="l">
+                          <Box
+                            textAlign="center"
+                            color="text-status-inactive"
+                            padding="l"
+                          >
                             No data sources configured
                           </Box>
                         </Container>
@@ -553,10 +790,16 @@ export default function ViewSemanticRAGMetadata() {
                             <KBTableCard
                               key={tableKey}
                               ds={ds}
-                              tableAnnotations={annotations.filter(a => a.tableKey === tableKey)}
-                              onAddAnnotation={(annotation) => handleAddAnnotation(tableKey, annotation)}
+                              tableAnnotations={annotations.filter(
+                                (a) => a.tableKey === tableKey,
+                              )}
+                              onAddAnnotation={(annotation) =>
+                                handleAddAnnotation(tableKey, annotation)
+                              }
                               onRemoveAnnotation={handleRemoveAnnotation}
                               versionKey={versionKey}
+                              semanticLayerId={id}
+                              semanticLayerVersion={currentVersion}
                             />
                           );
                         })
@@ -565,18 +808,141 @@ export default function ViewSemanticRAGMetadata() {
                   </SpaceBetween>
                 ),
               },
+              {
+                label: "Governed Metrics",
+                id: "governed-metrics",
+                content: id ? (
+                  // Not hardcoded "SemanticRAG": AdminDashboard routes every
+                  // non-VKG layer here, Hybrid included, and a Hybrid layer has
+                  // an ontology graph whose classes a metric can link to.
+                  <GovernedMetricsTab
+                    ontologyId={id}
+                    layerType={config?.type ?? null}
+                  />
+                ) : (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ),
+              },
+              {
+                label: "Governed Rules",
+                id: "governed-rules",
+                // The tab is always listed, and the body says which of the two
+                // cases this layer is in. Omitting the tab for Semantic RAG
+                // would leave a reviewer unable to tell "not supported here"
+                // apart from "feature not deployed".
+                //
+                // Gated on `rulesUnsupportedFor`, NOT on `!hasOntologyGraph`:
+                // until the config resolves, `config?.type` is undefined, and
+                // the negation would flash "rules do not apply to this layer"
+                // at a Hybrid reviewer whose layer they very much do.
+                content: !id ? (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ) : rulesUnsupportedFor(config?.type) ? (
+                  <Alert type="info" header="Governed rules do not apply here">
+                    {RULES_UNSUPPORTED_MESSAGE}
+                  </Alert>
+                ) : (
+                  <GovernedRulesTab
+                    ontologyId={id}
+                    layerType={config?.type ?? null}
+                    // Recorded on every threshold and rule approval. The API
+                    // rejects a blank approver with 422, so an unthreaded user
+                    // makes approval impossible rather than anonymous.
+                    currentUser={user?.email || user?.username}
+                  />
+                ),
+              },
+              {
+                label: "Lessons learned",
+                id: "lessons",
+                content: id ? (
+                  <LessonsLearnedTab ontologyId={id} />
+                ) : (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ),
+              },
+              {
+                label: "Feedback",
+                id: "feedback",
+                content: id ? (
+                  <FeedbackTab ontologyId={id} />
+                ) : (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ),
+              },
+              {
+                label: "Ground Truth",
+                id: "ground-truth",
+                content: id ? (
+                  <GroundTruthDataset id={id} />
+                ) : (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ),
+              },
+              {
+                label: "Evaluations",
+                id: "evaluations",
+                content: id ? (
+                  <Evaluations id={id} />
+                ) : (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ),
+              },
+              {
+                label: "Monitoring",
+                id: "monitoring",
+                content: id ? (
+                  <MonitoringTab ontologyId={id} />
+                ) : (
+                  <Box
+                    color="text-status-inactive"
+                    padding="l"
+                    textAlign="center"
+                  >
+                    No semantic layer selected
+                  </Box>
+                ),
+              },
             ]}
           />
-
-          {status === 'completed' && (
-            <Alert type="success" header="Semantic Metadata Ready">
-              Your metadata has been enriched and synced to the Knowledge Base.
-              You can now query your data using natural language.
-            </Alert>
-          )}
         </SpaceBetween>
       )}
-
     </SpaceBetween>
   );
 }

@@ -15,9 +15,15 @@
     ]
   },
   "context": {
-    "enableOntologyAgents": false,
+    "enableOntologyAgents": true,
+    "enableSemanticRag": true,
+    "enableHybrid": true,
     "enableRealtimeReplication": false,
     "enableBatchReplication": true,
+    "enableAcordSampleData": true,
+    "enableOboPassthrough": false,
+    "enableGovernedRules": true,
+    "enableSnowflakeConnector": true,
     "enableDirectAuth": true,
     "selfSignUpEnabled": false,
     "midway": false,

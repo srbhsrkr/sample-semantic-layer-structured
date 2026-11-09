@@ -96,6 +96,28 @@ def test_invoke_returns_suggestions_on_success():
     assert result['suggestions'][0]['question'].endswith('?')
 
 
+def test_invoke_caps_suggestions_at_three():
+    """If the agent overshoots and returns more than 3 suggestions, invoke()
+    must truncate to 3 (server-side enforcement of the prompt's 'exactly 3')."""
+    overshoot = json.dumps({
+        'suggestions': [
+            {'category': f'Cat {i}', 'question': f'Question {i}?'} for i in range(5)
+        ]
+    })
+    mock_response = _make_agent_response(overshoot)
+
+    with patch('agents.query_suggestions_agent.main.get_latest_metadata_item', return_value=VALID_CONFIG), \
+         patch('agents.query_suggestions_agent.main.create_suggestions_agent') as mock_create:
+        mock_agent = MagicMock(return_value=mock_response)
+        mock_create.return_value = mock_agent
+
+        result = invoke({'id': 'test-id'}, context=None)
+
+    assert len(result['suggestions']) == 3
+    # First 3 preserved in order.
+    assert [s['category'] for s in result['suggestions']] == ['Cat 0', 'Cat 1', 'Cat 2']
+
+
 def test_invoke_uses_ontology_name_in_user_input():
     """invoke() should include the ontology name in the prompt sent to the agent."""
     mock_response = _make_agent_response(VALID_SUGGESTIONS_JSON)
@@ -133,6 +155,62 @@ def test_invoke_strips_markdown_fences_correctly():
 
     assert 'suggestions' in result
     assert len(result['suggestions']) == 2
+
+
+# ---------------------------------------------------------------------------
+# Tests: advisory mode (free-form questions ABOUT the layer)
+# ---------------------------------------------------------------------------
+
+def test_invoke_advisory_mode_returns_answer_not_suggestions():
+    """A payload with a question routes to advisory and returns an answer dict
+    (with the structural no-SQL guarantee), not the 3-suggestion shape."""
+    with patch('agents.query_suggestions_agent.main.get_latest_metadata_item', return_value=VALID_CONFIG), \
+         patch('agents.query_suggestions_agent.main.build_advisory_answer') as mock_advisory:
+        mock_advisory.return_value = {
+            'answer': 'You can ask about policies and coverage.',
+            'metrics': [{'metric_id': 'm1', 'name': 'Revenue', 'description': 'TTM'}],
+            'executed_sql': '',
+            'results': [],
+            'kb_empty': False,
+        }
+        result = invoke(
+            {'id': 'test-id', 'question': 'what can I ask?'}, context=None,
+        )
+
+    assert 'suggestions' not in result
+    assert result['answer'] == 'You can ask about policies and coverage.'
+    assert result['executed_sql'] == ''
+    assert result['results'] == []
+    # The advisory builder was called with the layer id + question.
+    _, kwargs = mock_advisory.call_args
+    assert kwargs['layer_id'] == 'test-id'
+    assert kwargs['question'] == 'what can I ask?'
+
+
+def test_invoke_advisory_mode_explicit_flag():
+    """mode='advisory' selects advisory even with an empty question."""
+    with patch('agents.query_suggestions_agent.main.get_latest_metadata_item', return_value=VALID_CONFIG), \
+         patch('agents.query_suggestions_agent.main.build_advisory_answer') as mock_advisory:
+        mock_advisory.return_value = {'answer': 'x', 'metrics': [],
+                                      'executed_sql': '', 'results': [], 'kb_empty': True}
+        result = invoke({'id': 'test-id', 'mode': 'advisory'}, context=None)
+
+    assert mock_advisory.called
+    assert 'answer' in result
+
+
+def test_invoke_no_question_preserves_suggestions_default():
+    """No question + no advisory mode → unchanged 3-suggestion behavior; the
+    advisory builder is never called."""
+    mock_response = _make_agent_response(VALID_SUGGESTIONS_JSON)
+    with patch('agents.query_suggestions_agent.main.get_latest_metadata_item', return_value=VALID_CONFIG), \
+         patch('agents.query_suggestions_agent.main.create_suggestions_agent') as mock_create, \
+         patch('agents.query_suggestions_agent.main.build_advisory_answer') as mock_advisory:
+        mock_create.return_value = MagicMock(return_value=mock_response)
+        result = invoke({'id': 'test-id'}, context=None)
+
+    assert 'suggestions' in result
+    assert not mock_advisory.called
 
 
 def test_invoke_does_not_strip_backticks_inside_json():

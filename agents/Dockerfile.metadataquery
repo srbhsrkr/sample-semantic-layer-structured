@@ -18,6 +18,20 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy agent code
 COPY metadata_query_agent/ ./metadata_query_agent/
+# Shared modules (AGUIEmitter, streaming_runner, memory_hooks, guardrail_*).
+# Without this the AG-UI streaming chat path falls back to "AGUIEmitter is None"
+# and emits a single run_error SSE record, leaving the frontend stuck on "...".
+COPY shared/ ./shared/
+# slice_judge is the ONLY ontology_query module metadata_query_agent.main
+# imports (tier-2 RAG path uses build_slice_judge as the slice-sufficiency
+# judge, passing its own JUDGE_PROMPT). slice_judge depends only on stdlib +
+# pydantic + (lazy) strands, so just the two package __init__ files are needed
+# for the import to resolve. The supervisor*.py scaffolding + query_prompts are
+# no longer COPY'd — Tier 3 was removed when both query agents migrated to the
+# Strands graph workflow.
+COPY ontology_query_agent/__init__.py ./ontology_query_agent/__init__.py
+COPY ontology_query_agent/tier2/__init__.py ./ontology_query_agent/tier2/__init__.py
+COPY ontology_query_agent/tier2/slice_judge.py ./ontology_query_agent/tier2/slice_judge.py
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1

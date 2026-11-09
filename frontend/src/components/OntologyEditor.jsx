@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Box,
   SpaceBetween,
@@ -14,35 +14,68 @@ import {
   Badge,
   ButtonGroup,
   ExpandableSection,
-} from '@cloudscape-design/components';
-import { ontologyAPI } from '../services/api';
+} from "@cloudscape-design/components";
+import { ontologyAPI } from "../services/api";
 
 // ─── RDF / OWL constants ────────────────────────────────────────────────────
 
-const RDF_TYPE    = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#type';
-const OWL_CLASS   = 'http://www.w3.org/2002/07/owl#Class';
-const OWL_DTP     = 'http://www.w3.org/2002/07/owl#DatatypeProperty';
-const OWL_OBP     = 'http://www.w3.org/2002/07/owl#ObjectProperty';
-const RDFS_LABEL  = 'http://www.w3.org/2000/01/rdf-schema#label';
-const RDFS_COMMENT= 'http://www.w3.org/2000/01/rdf-schema#comment';
-const RDFS_DOMAIN = 'http://www.w3.org/2000/01/rdf-schema#domain';
-const RDFS_RANGE  = 'http://www.w3.org/2000/01/rdf-schema#range';
-const VKG_DB      = 'https://semantic-layer.aws/virtual-kg/hasDatabase';
-const VKG_TABLE   = 'https://semantic-layer.aws/virtual-kg/mapsToTable';
-const VKG_COL     = 'https://semantic-layer.aws/virtual-kg/mapsToColumn';
+const RDF_TYPE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const OWL_CLASS = "http://www.w3.org/2002/07/owl#Class";
+const OWL_DTP = "http://www.w3.org/2002/07/owl#DatatypeProperty";
+const OWL_OBP = "http://www.w3.org/2002/07/owl#ObjectProperty";
+const RDFS_LABEL = "http://www.w3.org/2000/01/rdf-schema#label";
+const RDFS_COMMENT = "http://www.w3.org/2000/01/rdf-schema#comment";
+const RDFS_DOMAIN = "http://www.w3.org/2000/01/rdf-schema#domain";
+const RDFS_RANGE = "http://www.w3.org/2000/01/rdf-schema#range";
+const VKG_DB = "https://semantic-layer.aws/virtual-kg/hasDatabase";
+const VKG_TABLE = "https://semantic-layer.aws/virtual-kg/mapsToTable";
+const VKG_COL = "https://semantic-layer.aws/virtual-kg/mapsToColumn";
+
+// Curated class-level metadata annotations — mirror the semantic-RAG metadata
+// document sections (Business Purpose, Business Concepts, etc.) so the
+// Knowledge-Graph Metadata view shows the same sections. Order here is the
+// display order on each class card. Overview/Columns are already shown as the
+// class description + Datatype Properties table, so they are not listed.
+const CLASS_SECTION_PREDICATES = [
+  {
+    pred: "https://semantic-layer.aws/virtual-kg/businessPurpose",
+    title: "Business Purpose",
+  },
+  {
+    pred: "https://semantic-layer.aws/virtual-kg/businessConcepts",
+    title: "Business Concepts & Synonyms",
+  },
+  {
+    pred: "https://semantic-layer.aws/virtual-kg/acordSourcePath",
+    title: "ACORD Source Path",
+  },
+  {
+    pred: "https://semantic-layer.aws/virtual-kg/referenceTables",
+    title: "Reference Tables",
+  },
+  {
+    pred: "https://semantic-layer.aws/virtual-kg/commonQueryPatterns",
+    title: "Common Query Patterns",
+  },
+  {
+    pred: "https://semantic-layer.aws/virtual-kg/sampleData",
+    title: "Sample Data",
+  },
+  { pred: "https://semantic-layer.aws/virtual-kg/notes", title: "Notes" },
+];
 
 // ─── N-Quads parser ──────────────────────────────────────────────────────────
 
 // Returns Map<subjectUri, Map<predicateUri, string[]>>
 function parseNQuads(content) {
   const subjects = new Map();
-  for (const raw of content.split('\n')) {
+  for (const raw of content.split("\n")) {
     const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
+    if (!line || line.startsWith("#")) continue;
 
     // <subject> <predicate> (<object>|"literal"[^^<type>|@lang]) <graph> .
     const m = line.match(
-      /^<([^>]+)>\s+<([^>]+)>\s+((?:<[^>]+>)|(?:"(?:[^"\\]|\\.)*"(?:\^\^<[^>]+>|@[\w-]+)?))\s+<[^>]+>\s*\.\s*$/
+      /^<([^>]+)>\s+<([^>]+)>\s+((?:<[^>]+>)|(?:"(?:[^"\\]|\\.)*"(?:\^\^<[^>]+>|@[\w-]+)?))\s+<[^>]+>\s*\.\s*$/,
     );
     if (!m) continue;
     const [, sub, pred, obj] = m;
@@ -56,14 +89,21 @@ function parseNQuads(content) {
 
 function getLiteral(preds, key) {
   const vals = preds.get(key);
-  if (!vals || !vals[0]) return '';
+  if (!vals || !vals[0]) return "";
   const m = vals[0].match(/^"((?:[^"\\]|\\.)*)"(?:\^\^<[^>]*>|@[\w-]+)?$/);
-  return m ? m[1].replace(/\\"/g, '"') : '';
+  if (!m) return "";
+  // Unescape the N-Quads literal: agents encode newlines/tabs inside curated
+  // metadata as \n / \t so each annotation stays a single physical line.
+  return m[1]
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, '"')
+    .replace(/\\\\/g, "\\");
 }
 
 function getUri(preds, key) {
   const vals = preds.get(key);
-  return vals?.[0]?.replace(/^<|>$/g, '') || '';
+  return vals?.[0]?.replace(/^<|>$/g, "") || "";
 }
 
 function hasType(preds, typeUri) {
@@ -71,9 +111,9 @@ function hasType(preds, typeUri) {
 }
 
 function xsdShort(uri) {
-  if (!uri) return '';
-  const h = uri.lastIndexOf('#');
-  return h !== -1 ? `xsd:${uri.slice(h + 1)}` : uri.split('/').pop();
+  if (!uri) return "";
+  const h = uri.lastIndexOf("#");
+  return h !== -1 ? `xsd:${uri.slice(h + 1)}` : uri.split("/").pop();
 }
 
 // Builds a sorted array of class objects with their properties and relationships
@@ -84,31 +124,39 @@ function buildOntologyModel(subjects) {
 
   for (const [uri, preds] of subjects) {
     if (hasType(preds, OWL_CLASS)) {
+      // Extract the curated metadata sections (Business Purpose, etc.) present
+      // on this class, preserving the declared display order and dropping any
+      // the agent omitted. Mirrors the semantic-RAG metadata section list.
+      const sections = CLASS_SECTION_PREDICATES.map(({ pred, title }) => ({
+        title,
+        body: getLiteral(preds, pred),
+      })).filter((s) => s.body);
       classes.set(uri, {
         uri,
-        label:       getLiteral(preds, RDFS_LABEL) || uri.split('/').pop(),
-        comment:     getLiteral(preds, RDFS_COMMENT),
+        label: getLiteral(preds, RDFS_LABEL) || uri.split("/").pop(),
+        comment: getLiteral(preds, RDFS_COMMENT),
         mapsToTable: getLiteral(preds, VKG_TABLE),
-        database:    getLiteral(preds, VKG_DB),
-        properties:  [],
+        database: getLiteral(preds, VKG_DB),
+        sections,
+        properties: [],
         relationships: [],
       });
     } else if (hasType(preds, OWL_DTP)) {
       dtProps.push({
         uri,
-        label:        getLiteral(preds, RDFS_LABEL) || uri.split('/').pop(),
-        comment:      getLiteral(preds, RDFS_COMMENT),
-        domain:       getUri(preds, RDFS_DOMAIN),
-        range:        xsdShort(getUri(preds, RDFS_RANGE)),
+        label: getLiteral(preds, RDFS_LABEL) || uri.split("/").pop(),
+        comment: getLiteral(preds, RDFS_COMMENT),
+        domain: getUri(preds, RDFS_DOMAIN),
+        range: xsdShort(getUri(preds, RDFS_RANGE)),
         mapsToColumn: getLiteral(preds, VKG_COL),
       });
     } else if (hasType(preds, OWL_OBP)) {
       obProps.push({
         uri,
-        label:  getLiteral(preds, RDFS_LABEL) || uri.split('/').pop(),
-        comment:getLiteral(preds, RDFS_COMMENT),
+        label: getLiteral(preds, RDFS_LABEL) || uri.split("/").pop(),
+        comment: getLiteral(preds, RDFS_COMMENT),
         domain: getUri(preds, RDFS_DOMAIN),
-        range:  getUri(preds, RDFS_RANGE),
+        range: getUri(preds, RDFS_RANGE),
       });
     }
   }
@@ -127,15 +175,15 @@ function buildOntologyModel(subjects) {
 
 function TypeBadge({ type }) {
   const colors = {
-    'xsd:string':   'grey',
-    'xsd:integer':  'blue',
-    'xsd:long':     'blue',
-    'xsd:double':   'severity-medium',
-    'xsd:boolean':  'severity-low',
-    'xsd:date':     'green',
-    'xsd:dateTime': 'green',
+    "xsd:string": "grey",
+    "xsd:integer": "blue",
+    "xsd:long": "blue",
+    "xsd:double": "severity-medium",
+    "xsd:boolean": "severity-low",
+    "xsd:date": "green",
+    "xsd:dateTime": "green",
   };
-  return <Badge color={colors[type] || 'grey'}>{type || 'string'}</Badge>;
+  return <Badge color={colors[type] || "grey"}>{type || "string"}</Badge>;
 }
 
 function ClassCard({ cls, annotatedTargets, onAnnotate }) {
@@ -143,47 +191,51 @@ function ClassCard({ cls, annotatedTargets, onAnnotate }) {
 
   const propColumns = [
     {
-      id: 'label',
-      header: 'Property',
+      id: "label",
+      header: "Property",
       cell: (p) => <Box fontWeight="bold">{p.label}</Box>,
       width: 160,
     },
     {
-      id: 'range',
-      header: 'Type',
+      id: "range",
+      header: "Type",
       cell: (p) => <TypeBadge type={p.range} />,
       minWidth: 130,
       width: 140,
     },
     {
-      id: 'mapsToColumn',
-      header: 'Column',
-      cell: (p) => <Box variant="code" fontSize="body-s">{p.mapsToColumn || '—'}</Box>,
+      id: "mapsToColumn",
+      header: "Column",
+      cell: (p) => (
+        <Box variant="code" fontSize="body-s">
+          {p.mapsToColumn || "—"}
+        </Box>
+      ),
       width: 180,
     },
     {
-      id: 'comment',
-      header: 'Description',
+      id: "comment",
+      header: "Description",
       cell: (p) => (
-        <span style={{ whiteSpace: 'normal', wordBreak: 'break-word' }}>
+        <span style={{ whiteSpace: "normal", wordBreak: "break-word" }}>
           {p.comment || <Box color="text-status-inactive">—</Box>}
         </span>
       ),
     },
     {
-      id: 'annotate',
-      header: '',
+      id: "annotate",
+      header: "",
       cell: (p) => {
         const key = `Property: ${cls.label}/${p.label}`;
         const annotated = annotatedTargets.has(key);
         return (
           <Button
-            variant={annotated ? 'normal' : 'inline-link'}
-            iconName={annotated ? 'check' : 'add-plus'}
+            variant={annotated ? "normal" : "inline-link"}
+            iconName={annotated ? "check" : "add-plus"}
             size="small"
             onClick={() => onAnnotate(key)}
           >
-            {annotated ? 'Annotated' : 'Annotate'}
+            {annotated ? "Annotated" : "Annotate"}
           </Button>
         );
       },
@@ -193,42 +245,42 @@ function ClassCard({ cls, annotatedTargets, onAnnotate }) {
 
   const relColumns = [
     {
-      id: 'label',
-      header: 'Relationship',
+      id: "label",
+      header: "Relationship",
       cell: (r) => <Box fontWeight="bold">{r.label}</Box>,
       width: 180,
     },
     {
-      id: 'range',
-      header: 'Target Class',
+      id: "range",
+      header: "Target Class",
       cell: (r) => {
-        const target = r.range.split('/').pop();
+        const target = r.range.split("/").pop();
         return <Badge color="green">{target}</Badge>;
       },
     },
     {
-      id: 'comment',
-      header: 'Description',
+      id: "comment",
+      header: "Description",
       cell: (r) => (
-        <span style={{ whiteSpace: 'normal', wordBreak: 'break-word' }}>
+        <span style={{ whiteSpace: "normal", wordBreak: "break-word" }}>
           {r.comment || <Box color="text-status-inactive">—</Box>}
         </span>
       ),
     },
     {
-      id: 'annotate',
-      header: '',
+      id: "annotate",
+      header: "",
       cell: (r) => {
         const key = `Relationship: ${cls.label}/${r.label}`;
         const annotated = annotatedTargets.has(key);
         return (
           <Button
-            variant={annotated ? 'normal' : 'inline-link'}
-            iconName={annotated ? 'check' : 'add-plus'}
+            variant={annotated ? "normal" : "inline-link"}
+            iconName={annotated ? "check" : "add-plus"}
             size="small"
             onClick={() => onAnnotate(key)}
           >
-            {annotated ? 'Annotated' : 'Annotate'}
+            {annotated ? "Annotated" : "Annotate"}
           </Button>
         );
       },
@@ -254,16 +306,27 @@ function ClassCard({ cls, annotatedTargets, onAnnotate }) {
       headerDescription={cls.comment}
       headerActions={
         <Button
-          variant={isClassAnnotated ? 'normal' : 'inline-link'}
-          iconName={isClassAnnotated ? 'check' : 'add-plus'}
+          variant={isClassAnnotated ? "normal" : "inline-link"}
+          iconName={isClassAnnotated ? "check" : "add-plus"}
           size="small"
           onClick={() => onAnnotate(`Class: ${cls.label}`)}
         >
-          {isClassAnnotated ? 'Annotated' : 'Annotate class'}
+          {isClassAnnotated ? "Annotated" : "Annotate class"}
         </Button>
       }
     >
       <SpaceBetween size="s">
+        {/* Curated metadata sections (Business Purpose, Business Concepts,
+            Reference Tables, Common Query Patterns, ACORD Source Path, Notes) —
+            mirrors the semantic-RAG Metadata view. Only present sections show. */}
+        {(cls.sections || []).map((s) => (
+          <div key={s.title}>
+            <Box variant="awsui-key-label">{s.title}</Box>
+            <Box variant="p" fontSize="body-s">
+              <span style={{ whiteSpace: "pre-wrap" }}>{s.body}</span>
+            </Box>
+          </div>
+        ))}
         {cls.properties.length > 0 && (
           <Table
             variant="embedded"
@@ -291,7 +354,7 @@ function ClassCard({ cls, annotatedTargets, onAnnotate }) {
           />
         )}
         {cls.properties.length === 0 && cls.relationships.length === 0 && (
-          <Box color="text-status-inactive" padding={{ top: 'xs' }}>
+          <Box color="text-status-inactive" padding={{ top: "xs" }}>
             No properties found for this class.
           </Box>
         )}
@@ -307,12 +370,15 @@ function renderHighlightedContent(content, annotations) {
   let result = [content];
   annotations.forEach(({ selectedText }) => {
     result = result.flatMap((part) => {
-      if (typeof part !== 'string') return [part];
+      if (typeof part !== "string") return [part];
       const idx = part.indexOf(selectedText);
       if (idx === -1) return [part];
       return [
         part.slice(0, idx),
-        <mark key={`${selectedText}-${idx}`} style={{ background: '#ffc107', borderRadius: 2 }}>
+        <mark
+          key={`${selectedText}-${idx}`}
+          style={{ background: "#ffc107", borderRadius: 2 }}
+        >
           {selectedText}
         </mark>,
         part.slice(idx + selectedText.length),
@@ -325,31 +391,31 @@ function renderHighlightedContent(content, annotations) {
 // ─── Main component ──────────────────────────────────────────────────────────
 
 export default function OntologyEditor({ id }) {
-  const [content, setContent]           = useState('');
-  const [version, setVersion]           = useState('');
-  const [versions, setVersions]         = useState([]);
-  const [annotations, setAnnotations]   = useState([]);
-  const [loading, setLoading]           = useState(true);
-  const [error, setError]               = useState(null);
-  const [viewMode, setViewMode]         = useState('structured');
+  const [content, setContent] = useState("");
+  const [version, setVersion] = useState("");
+  const [versions, setVersions] = useState([]);
+  const [annotations, setAnnotations] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [viewMode, setViewMode] = useState("structured");
 
   // Annotation modal state
-  const [pendingTarget, setPendingTarget] = useState(''); // structured key or raw selection
-  const [pendingSelection, setPendingSelection] = useState(''); // raw text selection only
-  const [showModal, setShowModal]         = useState(false);
-  const [comment, setComment]             = useState('');
-  const [generating, setGenerating]       = useState(false);
+  const [pendingTarget, setPendingTarget] = useState(""); // structured key or raw selection
+  const [pendingSelection, setPendingSelection] = useState(""); // raw text selection only
+  const [showModal, setShowModal] = useState(false);
+  const [comment, setComment] = useState("");
+  const [generating, setGenerating] = useState(false);
 
   // Parse N-Quads into structured model whenever content changes
   const ontologyModel = useMemo(
     () => (content ? buildOntologyModel(parseNQuads(content)) : []),
-    [content]
+    [content],
   );
 
   // Set of annotation targets for quick "is annotated?" checks
   const annotatedTargets = useMemo(
     () => new Set(annotations.map((a) => a.selectedText)),
-    [annotations]
+    [annotations],
   );
 
   const loadVersionsAndContent = useCallback(async () => {
@@ -363,23 +429,25 @@ export default function OntologyEditor({ id }) {
     }
     const allVersions = versResult.data.versions || [];
     setVersions(allVersions);
-    const latest = allVersions[0]?.version || 'v1';
+    const latest = allVersions[0]?.version || "v1";
     await loadContent(latest);
     setVersion(latest);
     setLoading(false);
   }, [id]);
 
-  useEffect(() => { loadVersionsAndContent(); }, [loadVersionsAndContent]);
+  useEffect(() => {
+    loadVersionsAndContent();
+  }, [loadVersionsAndContent]);
 
   // Raw view: capture text selections
   useEffect(() => {
-    if (viewMode !== 'raw') return;
+    if (viewMode !== "raw") return;
     const handler = () => {
-      const sel = window.getSelection?.()?.toString?.().trim() || '';
+      const sel = window.getSelection?.()?.toString?.().trim() || "";
       if (sel) setPendingSelection(sel);
     };
-    document.addEventListener('mouseup', handler);
-    return () => document.removeEventListener('mouseup', handler);
+    document.addEventListener("mouseup", handler);
+    return () => document.removeEventListener("mouseup", handler);
   }, [viewMode]);
 
   const loadContent = async (v) => {
@@ -411,9 +479,9 @@ export default function OntologyEditor({ id }) {
       { id: Date.now().toString(), selectedText: pendingTarget, comment },
     ]);
     setShowModal(false);
-    setPendingTarget('');
-    setPendingSelection('');
-    setComment('');
+    setPendingTarget("");
+    setPendingSelection("");
+    setComment("");
   };
 
   const handleGenerate = async () => {
@@ -433,11 +501,12 @@ export default function OntologyEditor({ id }) {
       attempts++;
       const status = await ontologyAPI.getBuildStatus(id);
       const st = status?.data?.status;
-      if (st === 'completed' || st === 'failed' || attempts > 60) {
+      if (st === "completed" || st === "failed" || attempts > 60) {
         clearInterval(poll);
         setGenerating(false);
         setAnnotations([]);
-        if (st === 'failed') setError('Revision failed. Check build status for details.');
+        if (st === "failed")
+          setError("Revision failed. Check build status for details.");
         else await loadVersionsAndContent();
       }
     }, 5000);
@@ -456,7 +525,8 @@ export default function OntologyEditor({ id }) {
     label: `${v.version} (${v.status})`,
     value: v.version,
   }));
-  const selectedVersionOption = versionOptions.find((o) => o.value === version) || null;
+  const selectedVersionOption =
+    versionOptions.find((o) => o.value === version) || null;
 
   return (
     <SpaceBetween size="l">
@@ -479,24 +549,27 @@ export default function OntologyEditor({ id }) {
               variant="icon"
               items={[
                 {
-                  type: 'icon-button',
-                  id: 'structured',
-                  iconName: 'list',
-                  text: 'Structured view',
-                  pressed: viewMode === 'structured',
+                  type: "icon-button",
+                  id: "structured",
+                  iconName: "list",
+                  text: "Structured view",
+                  pressed: viewMode === "structured",
                 },
                 {
-                  type: 'icon-button',
-                  id: 'raw',
-                  iconName: 'script',
-                  text: 'View raw N-Quads',
-                  pressed: viewMode === 'raw',
+                  type: "icon-button",
+                  id: "raw",
+                  iconName: "script",
+                  text: "View raw N-Quads",
+                  pressed: viewMode === "raw",
                 },
               ]}
-              onItemClick={({ detail }) => setViewMode(detail.id === viewMode ? 'structured' : detail.id)}
+              onItemClick={({ detail }) =>
+                setViewMode(detail.id === viewMode ? "structured" : detail.id)
+              }
             />
             <Box variant="p">
-              {annotations.length} annotation{annotations.length !== 1 ? 's' : ''}
+              {annotations.length} annotation
+              {annotations.length !== 1 ? "s" : ""}
             </Box>
             <Button
               variant="primary"
@@ -513,10 +586,11 @@ export default function OntologyEditor({ id }) {
       </Header>
 
       {/* ── Structured view ── */}
-      {viewMode === 'structured' && (
-        ontologyModel.length === 0 ? (
+      {viewMode === "structured" &&
+        (ontologyModel.length === 0 ? (
           <Box textAlign="center" color="text-status-inactive" padding="l">
-            No classes found. Switch to Raw view to inspect the N-Quads directly.
+            No classes found. Switch to Raw view to inspect the N-Quads
+            directly.
           </Box>
         ) : (
           <SpaceBetween size="m">
@@ -529,14 +603,19 @@ export default function OntologyEditor({ id }) {
               />
             ))}
           </SpaceBetween>
-        )
-      )}
+        ))}
 
       {/* ── Raw N-Quads view ── */}
-      {viewMode === 'raw' && (
+      {viewMode === "raw" && (
         <SpaceBetween size="s">
           <Box variant="code">
-            <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'monospace', fontSize: 13 }}>
+            <pre
+              style={{
+                whiteSpace: "pre-wrap",
+                fontFamily: "monospace",
+                fontSize: 13,
+              }}
+            >
               {renderHighlightedContent(content, annotations)}
             </pre>
           </Box>
@@ -554,12 +633,16 @@ export default function OntologyEditor({ id }) {
         header="Add Annotation"
         onDismiss={() => {
           setShowModal(false);
-          setPendingTarget('');
-          setPendingSelection('');
-          setComment('');
+          setPendingTarget("");
+          setPendingSelection("");
+          setComment("");
         }}
         footer={
-          <Button variant="primary" disabled={!comment.trim()} onClick={confirmAnnotation}>
+          <Button
+            variant="primary"
+            disabled={!comment.trim()}
+            onClick={confirmAnnotation}
+          >
             Confirm
           </Button>
         }
@@ -568,17 +651,17 @@ export default function OntologyEditor({ id }) {
           label={
             <pre
               style={{
-                whiteSpace: 'pre-wrap',
-                fontFamily: 'monospace',
+                whiteSpace: "pre-wrap",
+                fontFamily: "monospace",
                 fontSize: 12,
-                background: '#fffde7',
-                padding: '6px 10px',
-                borderRadius: '4px',
-                borderLeft: '3px solid #ffc107',
+                background: "#fffde7",
+                padding: "6px 10px",
+                borderRadius: "4px",
+                borderLeft: "3px solid #ffc107",
                 margin: 0,
-                maxHeight: '120px',
-                overflowY: 'auto',
-                wordBreak: 'break-all',
+                maxHeight: "120px",
+                overflowY: "auto",
+                wordBreak: "break-all",
               }}
             >
               {pendingTarget}
@@ -603,35 +686,45 @@ export default function OntologyEditor({ id }) {
               <div
                 key={a.id}
                 style={{
-                  border: '1px solid #d5dbdb',
-                  borderRadius: '8px',
-                  background: '#f8f8f8',
-                  padding: '12px 16px',
+                  border: "1px solid #d5dbdb",
+                  borderRadius: "8px",
+                  background: "#f8f8f8",
+                  padding: "12px 16px",
                 }}
               >
                 <SpaceBetween size="xs">
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                    }}
+                  >
                     <Box variant="awsui-key-label">Target</Box>
                     <Button
                       variant="icon"
                       iconName="close"
                       ariaLabel="delete annotation"
-                      onClick={() => setAnnotations((prev) => prev.filter((x) => x.id !== a.id))}
+                      onClick={() =>
+                        setAnnotations((prev) =>
+                          prev.filter((x) => x.id !== a.id),
+                        )
+                      }
                     />
                   </div>
                   <pre
                     style={{
-                      whiteSpace: 'pre-wrap',
-                      fontFamily: 'monospace',
+                      whiteSpace: "pre-wrap",
+                      fontFamily: "monospace",
                       fontSize: 12,
-                      background: '#fffde7',
-                      padding: '8px 12px',
-                      borderRadius: '4px',
-                      borderLeft: '3px solid #ffc107',
+                      background: "#fffde7",
+                      padding: "8px 12px",
+                      borderRadius: "4px",
+                      borderLeft: "3px solid #ffc107",
                       margin: 0,
-                      maxHeight: '200px',
-                      overflowY: 'auto',
-                      wordBreak: 'break-all',
+                      maxHeight: "200px",
+                      overflowY: "auto",
+                      wordBreak: "break-all",
                     }}
                   >
                     {a.selectedText}

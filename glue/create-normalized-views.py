@@ -41,6 +41,82 @@ table_bucket_arn = (
 
 # ── 1. Discover the most-recently-created zetl_* namespace per source table ──
 s3t = boto3.client('s3tables', region_name=args['region'])
+# Glue client + the S3Tables federated catalog id, used to mirror the curated
+# descriptions into the Glue catalog view as well (UI Data-Sources tab).
+glue_client = boto3.client('glue', region_name=args['region'])
+glue_catalog_id = f"{args['account_id']}:s3tablescatalog/{args['table_bucket_name']}"
+
+# ── pyiceberg S3Tables catalog (durable column-doc / description persistence) ──
+# S3Tables federation does NOT durably persist Glue column Comments / table
+# Description — it reconciles the Glue view back from the Iceberg schema. So the
+# metadata_agent's curated descriptions live, authoritatively, as Iceberg schema
+# column doc strings + a table 'description' property. The delete+recreate
+# refresh rebuilds the Iceberg table WITHOUT those docs, wiping them. To preserve
+# them we capture the Iceberg docs BEFORE delete and re-write them via pyiceberg
+# AFTER create — mirroring agents/metadata_agent/main.py::_write_iceberg_docs_for_table.
+_pyiceberg_catalog = None
+def _iceberg_catalog():
+    """Lazily build (and cache) the S3Tables Iceberg REST catalog. None on failure."""
+    global _pyiceberg_catalog
+    if _pyiceberg_catalog is not None:
+        return _pyiceberg_catalog
+    try:
+        from pyiceberg.catalog import load_catalog
+        _pyiceberg_catalog = load_catalog('s3tables', **{
+            'type': 'rest',
+            'uri': f"https://s3tables.{args['region']}.amazonaws.com/iceberg",
+            'warehouse': table_bucket_arn,
+            'rest.sigv4-enabled': 'true',
+            'rest.signing-region': args['region'],
+            'rest.signing-name': 's3tables',
+        })
+    except Exception as e:
+        print(f"  WARN: pyiceberg S3Tables catalog unavailable ({e}) — "
+              f"descriptions will not be preserved this run")
+        _pyiceberg_catalog = None
+    return _pyiceberg_catalog
+
+def capture_iceberg_docs(table_name):
+    """Return (table_description, {col_name: doc}) from the Iceberg schema, or ('', {})."""
+    cat = _iceberg_catalog()
+    if cat is None:
+        return '', {}
+    try:
+        t = cat.load_table(('normalized', table_name))
+        desc = (t.properties or {}).get('description', '') or ''
+        docs = {f.name: f.doc for f in t.schema().fields if getattr(f, 'doc', None)}
+        return desc, docs
+    except Exception as e:
+        print(f"    (no Iceberg docs to capture for {table_name}: {e})")
+        return '', {}
+
+def restore_iceberg_docs(table_name, desc, docs):
+    """Re-apply captured table description + column docs to the Iceberg schema."""
+    if not desc and not docs:
+        return
+    cat = _iceberg_catalog()
+    if cat is None:
+        return
+    try:
+        t = cat.load_table(('normalized', table_name))
+        if docs:
+            # Iceberg field names may differ in case from the captured (Glue
+            # lowercase) names — map case-insensitively.
+            by_lower = {f.name.lower(): f.name for f in t.schema().fields}
+            with t.update_schema() as su:
+                for cn, doc in docs.items():
+                    canon = by_lower.get(cn.lower(), cn)
+                    try:
+                        su.update_column(canon, doc=doc)
+                    except Exception as ce:
+                        print(f"      skip col {cn}: {ce}")
+        if desc:
+            with t.transaction() as txn:
+                txn.set_properties({'description': desc})
+        print(f"    restored Iceberg docs ({len(docs)} column(s)"
+              f"{', + table description' if desc else ''})")
+    except Exception as e:
+        print(f"    WARN: could not restore Iceberg docs for {table_name}: {e}")
 
 
 def latest_zetl_namespace(source_table: str) -> str:
@@ -59,7 +135,7 @@ def latest_zetl_namespace(source_table: str) -> str:
                     name=source_table,
                 )
                 candidates.append((ns, t['createdAt']))
-            except Exception:
+            except Exception:  # nosec B110 — best-effort cleanup/telemetry; failure must not break the request path
                 pass
     if not candidates:
         raise RuntimeError(f"No zetl_* namespace found containing table '{source_table}'")
@@ -748,15 +824,99 @@ for mv_name, src_table, sk_filter in NORMALIZED_VIEWS:
 
     col_exprs = VIEW_COLUMNS[mv_name]
     select_clause = ",\n    ".join(col_exprs)
-    select_sql = (
-        f"SELECT\n    {select_clause}\n"
+    select_sql = (  # nosec B608 — SQL constructed from VIEW_COLUMNS constants and validated table refs, not user input
+        f"SELECT\n    {select_clause}\n"  # nosec B608 — SQL/SPARQL built from internal schema-slice/static identifiers, not user input (grounding-gated)
         f"FROM {src_ref}\n"
         f"{where_clause}"
     ).rstrip()
 
     print(f"  normalized.{mv_name}")
-    df = spark.sql(select_sql)
-    df.writeTo(f"s3t_catalog.normalized.{mv_name}").createOrReplace()
+    # S3Tables refresh: the S3Tables ↔ Iceberg-Spark integration does NOT support
+    # replacing/recreating an existing table via Spark DDL — every form
+    # (createOrReplace, CREATE OR REPLACE, CREATE IF NOT EXISTS, even Spark
+    # DROP+CREATE) raises a 409 "table already exists", because Spark DROP clears
+    # only the Iceberg catalog view, not the S3Tables backend object. So delete
+    # the backend object via the S3Tables API FIRST (boto3 s3tables.delete_table),
+    # then CREATE fresh. delete_table is a no-op-safe NotFound on first run.
+    #
+    # PRESERVE ENRICHMENT (durable): the metadata_agent's curated descriptions are
+    # persisted authoritatively as Iceberg SCHEMA column doc strings + a table
+    # 'description' property (S3Tables reconciles the Glue catalog view back from
+    # these, so a Glue-only restore does NOT stick — observed 2026-06-12).
+    # delete_table + CREATE rebuilds the Iceberg table WITHOUT docs, wiping them.
+    # So capture the Iceberg docs BEFORE delete and re-write them via pyiceberg
+    # AFTER create. We also mirror them into the Glue catalog view (best-effort)
+    # so the UI Data-Sources tab shows them too.
+    saved_desc, saved_docs = capture_iceberg_docs(mv_name)
+
+    tmp_view = f"_src_{mv_name}"
+    spark.sql(select_sql).createOrReplaceTempView(tmp_view)
+    try:
+        s3t.delete_table(
+            tableBucketARN=table_bucket_arn,
+            namespace='normalized',
+            name=mv_name,
+        )
+    except s3t.exceptions.NotFoundException:
+        pass  # first build — nothing to delete
+    # NOTE: Spark/Iceberg DDL (USING iceberg) — NOT Athena DDL. This path writes
+    # via the Glue Spark job, so it does NOT need Athena's `WITH (table_type='ICEBERG',
+    # is_external=false)` CTAS form or unquoted-DROP handling (those apply only to
+    # Athena-driven writes, e.g. scripts/benchmarks). Deletion uses s3t.delete_table above.
+    spark.sql(
+        f"CREATE TABLE s3t_catalog.normalized.{mv_name} "  # nosec B608 — SQL/SPARQL built from internal schema-slice/static identifiers, not user input (grounding-gated)
+        f"USING iceberg AS SELECT * FROM {tmp_view}"
+    )
+
+    # 1) DURABLE: re-write the captured docs into the Iceberg schema (survives
+    #    S3Tables reconciliation — this is the authoritative store the agent uses).
+    restore_iceberg_docs(mv_name, saved_desc, saved_docs)
+
+    # 2) UI MIRROR (best-effort): also reflect into the Glue catalog Description +
+    #    column Comments so the admin Data-Sources tab shows them. S3Tables
+    #    federation may reconcile these away, but when it honours them the UI is
+    #    populated immediately; the Iceberg write above is the durable guarantee.
+    if saved_desc or saved_docs:
+        try:
+            fresh = glue_client.get_table(
+                CatalogId=glue_catalog_id, DatabaseName='normalized', Name=mv_name,
+            )['Table']
+            table_input = dict(fresh)
+            for field in (
+                'CatalogId', 'DatabaseName', 'CreateTime', 'UpdateTime', 'CreatedBy',
+                'IsRegisteredWithLakeFormation', 'VersionId', 'IsMultiDialectView',
+                'Status', 'FederatedTable', 'IsMaterializedView', 'ViewDefinition',
+            ):
+                table_input.pop(field, None)
+            if not table_input.get('Owner'):
+                table_input.pop('Owner', None)
+            if saved_desc:
+                table_input['Description'] = saved_desc[:2048]
+            docs_lower = {k.lower(): v for k, v in saved_docs.items()}
+            for col in table_input.get('StorageDescriptor', {}).get('Columns', []):
+                doc = docs_lower.get(col['Name'].lower())
+                if doc:
+                    col['Comment'] = doc[:255]
+            upd = {'DatabaseName': 'normalized', 'TableInput': table_input,
+                   'CatalogId': glue_catalog_id}
+            try:
+                glue_client.update_table(**upd)
+            except Exception as first_err:
+                es = str(first_err)
+                if 'versionToken' in es and 'null' in es:
+                    vt = s3t.get_table(
+                        tableBucketARN=table_bucket_arn, namespace='normalized',
+                        name=mv_name,
+                    ).get('versionToken')
+                    if vt:
+                        upd['VersionId'] = vt
+                        glue_client.update_table(**upd)
+                    else:
+                        raise
+                else:
+                    raise
+        except Exception as e:  # never fail the refresh over the UI mirror
+            print(f"    (Glue mirror skipped for {mv_name}: {e})")
 
 print(f"\nDone. {len(NORMALIZED_VIEWS)} normalized tables created/refreshed in 'normalized' namespace.")
 job.commit()

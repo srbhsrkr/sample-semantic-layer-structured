@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from "react";
 import {
   Container,
   Header,
@@ -14,27 +14,28 @@ import {
   ExpandableSection,
   StatusIndicator,
   Table,
-} from '@cloudscape-design/components';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { dataSourceAPI, ontologyAPI } from '../../services/api';
+} from "@cloudscape-design/components";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { dataSourceAPI, ontologyAPI } from "../../services/api";
+import CancelDraftButton from "../../components/CancelDraftButton";
 
 // Derive a short human-readable label and badge colour from a catalogId string.
 // AWSDataCatalog  → "DynamoDB Catalog"   blue
 // s3tablescatalog/<bucket> → "S3 Tables (<bucket>)"  green
 function catalogLabel(catalogId) {
-  if (!catalogId || catalogId === 'AWSDataCatalog') {
-    return { text: 'AWS Data Catalog', color: 'blue' };
+  if (!catalogId || catalogId === "AWSDataCatalog") {
+    return { text: "AWS Data Catalog", color: "blue" };
   }
-  if (catalogId.startsWith('s3tablescatalog/')) {
-    const bucket = catalogId.replace('s3tablescatalog/', '');
-    return { text: `S3 Tables · ${bucket}`, color: 'green' };
+  if (catalogId.startsWith("s3tablescatalog/")) {
+    const bucket = catalogId.replace("s3tablescatalog/", "");
+    return { text: `S3 Tables · ${bucket}`, color: "green" };
   }
-  return { text: catalogId, color: 'grey' };
+  return { text: catalogId, color: "grey" };
 }
 
 // Build a stable unique key for a table across all catalogs.
 function tableKey(catalogId, databaseName, tableName) {
-  return `${catalogId || 'AWSDataCatalog'}::${databaseName}.${tableName}`;
+  return `${catalogId || "AWSDataCatalog"}::${databaseName}.${tableName}`;
 }
 
 // Derive the Athena data source from a catalogId.
@@ -42,15 +43,15 @@ function tableKey(catalogId, databaseName, tableName) {
 // - starts with 's3tablescatalog/'   → 'AwsDataCatalog'  (S3 Tables sub-catalog)
 // - anything else (e.g. 'dynamodb_catalog') → catalogId  (federated connector IS the data source)
 function dataSourceForCatalog(catalogId) {
-  if (!catalogId || catalogId === 'AWSDataCatalog') return 'AwsDataCatalog';
-  if (catalogId.startsWith('s3tablescatalog/')) return 'AwsDataCatalog';
+  if (!catalogId || catalogId === "AWSDataCatalog") return "AwsDataCatalog";
+  if (catalogId.startsWith("s3tablescatalog/")) return "AwsDataCatalog";
   return catalogId;
 }
 
 export default function SelectDataSources({ user }) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const id = searchParams.get('id');
+  const id = searchParams.get("id");
 
   const [databases, setDatabases] = useState([]);
   const [selectedTables, setSelectedTables] = useState([]);
@@ -62,7 +63,7 @@ export default function SelectDataSources({ user }) {
 
   useEffect(() => {
     if (!id) {
-      setError('No ID provided. Please complete Step 1 first.');
+      setError("No ID provided. Please complete Step 1 first.");
       return;
     }
     loadDataSources();
@@ -77,25 +78,34 @@ export default function SelectDataSources({ user }) {
       // queries the correct catalog.
       const databasesWithTables = await Promise.all(
         result.data.databases.map(async (db) => {
-          const tablesResult = await dataSourceAPI.listGlueTables(db.name, db.catalogId);
+          const tablesResult = await dataSourceAPI.listGlueTables(
+            db.name,
+            db.catalogId,
+          );
           return {
             ...db,
             tables: tablesResult.success ? tablesResult.data.tables : [],
           };
-        })
+        }),
       );
       setDatabases(databasesWithTables);
     } else {
-      setError(result.error || 'Failed to load data sources');
+      setError(result.error || "Failed to load data sources");
     }
     setLoading(false);
   };
 
-  const handleDatabaseSelection = (catalogId, databaseName, tables, checked) => {
-    const resolvedCatalogId = catalogId || 'AWSDataCatalog';
+  const handleDatabaseSelection = (
+    catalogId,
+    databaseName,
+    tables,
+    checked,
+  ) => {
+    const resolvedCatalogId = catalogId || "AWSDataCatalog";
     // Remove any existing entries for this catalog+database
     const others = selectedTables.filter(
-      (t) => !(t.databaseName === databaseName && t.catalogId === resolvedCatalogId)
+      (t) =>
+        !(t.databaseName === databaseName && t.catalogId === resolvedCatalogId),
     );
     if (checked) {
       // Expand to individual table entries so the agent always receives explicit table names
@@ -112,12 +122,22 @@ export default function SelectDataSources({ user }) {
     }
   };
 
-  const handleTableSelection = (catalogId, databaseName, tableName, checked) => {
-    const resolvedCatalogId = catalogId || 'AWSDataCatalog';
+  const handleTableSelection = (
+    catalogId,
+    databaseName,
+    tableName,
+    checked,
+  ) => {
+    const resolvedCatalogId = catalogId || "AWSDataCatalog";
     const key = tableKey(resolvedCatalogId, databaseName, tableName);
     // If entire database was selected, remove the database-level entry first
     const withoutDbLevel = selectedTables.filter(
-      (t) => !(t.databaseName === databaseName && t.catalogId === resolvedCatalogId && t.tableName === null)
+      (t) =>
+        !(
+          t.databaseName === databaseName &&
+          t.catalogId === resolvedCatalogId &&
+          t.tableName === null
+        ),
     );
     if (checked) {
       setSelectedTables([
@@ -136,47 +156,59 @@ export default function SelectDataSources({ user }) {
   };
 
   const isTableSelected = (catalogId, databaseName, tableName) => {
-    const resolvedCatalogId = catalogId || 'AWSDataCatalog';
+    const resolvedCatalogId = catalogId || "AWSDataCatalog";
     // Selected if individual entry exists OR database-level entry covers it
     return selectedTables.some(
       (t) =>
         t.catalogId === resolvedCatalogId &&
         t.databaseName === databaseName &&
-        (t.tableName === tableName || t.tableName === null)
+        (t.tableName === tableName || t.tableName === null),
     );
   };
 
   const isDatabaseSelected = (catalogId, databaseName, tables) => {
-    const resolvedCatalogId = catalogId || 'AWSDataCatalog';
+    const resolvedCatalogId = catalogId || "AWSDataCatalog";
     // True if there's a database-level entry OR all individual tables are selected
     const hasDbLevel = selectedTables.some(
-      (t) => t.databaseName === databaseName && t.catalogId === resolvedCatalogId && t.tableName === null
+      (t) =>
+        t.databaseName === databaseName &&
+        t.catalogId === resolvedCatalogId &&
+        t.tableName === null,
     );
     if (hasDbLevel) return true;
     if (!tables || tables.length === 0) return false;
     const inDb = selectedTables.filter(
-      (t) => t.databaseName === databaseName && t.catalogId === resolvedCatalogId && t.tableName !== null
+      (t) =>
+        t.databaseName === databaseName &&
+        t.catalogId === resolvedCatalogId &&
+        t.tableName !== null,
     );
     return inDb.length === tables.length;
   };
 
   const isDatabaseIndeterminate = (catalogId, databaseName, tables) => {
-    const resolvedCatalogId = catalogId || 'AWSDataCatalog';
+    const resolvedCatalogId = catalogId || "AWSDataCatalog";
     // Not indeterminate if entire database is selected
     const hasDbLevel = selectedTables.some(
-      (t) => t.databaseName === databaseName && t.catalogId === resolvedCatalogId && t.tableName === null
+      (t) =>
+        t.databaseName === databaseName &&
+        t.catalogId === resolvedCatalogId &&
+        t.tableName === null,
     );
     if (hasDbLevel) return false;
     if (!tables || tables.length === 0) return false;
     const inDb = selectedTables.filter(
-      (t) => t.databaseName === databaseName && t.catalogId === resolvedCatalogId && t.tableName !== null
+      (t) =>
+        t.databaseName === databaseName &&
+        t.catalogId === resolvedCatalogId &&
+        t.tableName !== null,
     );
     return inDb.length > 0 && inDb.length < tables.length;
   };
 
   const handleSubmit = async () => {
     if (selectedTables.length === 0) {
-      setError('Please select at least one data source');
+      setError("Please select at least one data source");
       return;
     }
 
@@ -198,7 +230,9 @@ export default function SelectDataSources({ user }) {
               size: file.size,
             });
           } else {
-            setError(`File upload failed for "${file.name}": ${uploadResult.error}`);
+            setError(
+              `File upload failed for "${file.name}": ${uploadResult.error}`,
+            );
             setSubmitting(false);
             return;
           }
@@ -209,7 +243,7 @@ export default function SelectDataSources({ user }) {
         id: id,
         selectedDataSources: selectedTables,
         uploadedDocuments: uploadedFilePaths,
-        status: 'data_sources_selected',
+        status: "data_sources_selected",
       };
 
       const result = await ontologyAPI.createOntologyConfig(updateData);
@@ -220,10 +254,10 @@ export default function SelectDataSources({ user }) {
           navigate(`/admin/review-metadata?id=${id}`);
         }, 1500);
       } else {
-        setError(result.error || 'Failed to save data source selection');
+        setError(result.error || "Failed to save data source selection");
       }
     } catch (err) {
-      setError(err.message || 'An error occurred');
+      setError(err.message || "An error occurred");
     } finally {
       setSubmitting(false);
     }
@@ -231,7 +265,7 @@ export default function SelectDataSources({ user }) {
 
   // Group databases by catalogId for display
   const groupedByCatalog = databases.reduce((acc, db) => {
-    const key = db.catalogId || 'AWSDataCatalog';
+    const key = db.catalogId || "AWSDataCatalog";
     if (!acc[key]) acc[key] = [];
     acc[key].push(db);
     return acc;
@@ -244,6 +278,7 @@ export default function SelectDataSources({ user }) {
       <Header
         variant="h1"
         description="Step 2 of 5: Select data sources from AWS Glue Catalog and optionally upload existing documentation"
+        actions={<CancelDraftButton ontologyId={id} />}
       >
         Select Data Sources
       </Header>
@@ -278,7 +313,8 @@ export default function SelectDataSources({ user }) {
           </Box>
         ) : databases.length === 0 ? (
           <Box textAlign="center" padding="l" color="text-status-inactive">
-            No databases found in Glue Catalog. Please ensure your Glue crawlers have run.
+            No databases found in Glue Catalog. Please ensure your Glue crawlers
+            have run.
           </Box>
         ) : (
           <SpaceBetween size="l">
@@ -296,14 +332,22 @@ export default function SelectDataSources({ user }) {
                       <SpaceBetween size="s">
                         {/* Database-level checkbox */}
                         <Checkbox
-                          checked={isDatabaseSelected(database.catalogId, database.name, database.tables)}
-                          indeterminate={isDatabaseIndeterminate(database.catalogId, database.name, database.tables)}
+                          checked={isDatabaseSelected(
+                            database.catalogId,
+                            database.name,
+                            database.tables,
+                          )}
+                          indeterminate={isDatabaseIndeterminate(
+                            database.catalogId,
+                            database.name,
+                            database.tables,
+                          )}
                           onChange={({ detail }) =>
                             handleDatabaseSelection(
                               database.catalogId,
                               database.name,
                               database.tables,
-                              detail.checked
+                              detail.checked,
                             )
                           }
                         >
@@ -312,7 +356,7 @@ export default function SelectDataSources({ user }) {
                               {database.name}
                             </Box>
                             <Box variant="small" color="text-body-secondary">
-                              {database.description || 'No description'} •{' '}
+                              {database.description || "No description"} •{" "}
                               {database.tables?.length || 0} tables
                             </Box>
                           </SpaceBetween>
@@ -325,25 +369,36 @@ export default function SelectDataSources({ user }) {
                           defaultExpanded={false}
                         >
                           {database.tables && database.tables.length > 0 ? (
-                            <Box padding={{ top: 's' }}>
+                            <Box padding={{ top: "s" }}>
                               <ColumnLayout columns={2}>
                                 {database.tables.map((table) => (
                                   <Checkbox
-                                    key={tableKey(database.catalogId, database.name, table.name)}
-                                    checked={isTableSelected(database.catalogId, database.name, table.name)}
+                                    key={tableKey(
+                                      database.catalogId,
+                                      database.name,
+                                      table.name,
+                                    )}
+                                    checked={isTableSelected(
+                                      database.catalogId,
+                                      database.name,
+                                      table.name,
+                                    )}
                                     onChange={({ detail }) =>
                                       handleTableSelection(
                                         database.catalogId,
                                         database.name,
                                         table.name,
-                                        detail.checked
+                                        detail.checked,
                                       )
                                     }
                                   >
                                     <SpaceBetween size="xxxs">
                                       <Box variant="strong">{table.name}</Box>
-                                      <Box variant="small" color="text-body-secondary">
-                                        {table.description || 'No description'}
+                                      <Box
+                                        variant="small"
+                                        color="text-body-secondary"
+                                      >
+                                        {table.description || "No description"}
                                       </Box>
                                     </SpaceBetween>
                                   </Checkbox>
@@ -351,7 +406,9 @@ export default function SelectDataSources({ user }) {
                               </ColumnLayout>
                             </Box>
                           ) : (
-                            <Box color="text-status-inactive">No tables found</Box>
+                            <Box color="text-status-inactive">
+                              No tables found
+                            </Box>
                           )}
                         </ExpandableSection>
                       </SpaceBetween>
@@ -364,9 +421,10 @@ export default function SelectDataSources({ user }) {
         )}
 
         {selectedTables.length > 0 && (
-          <Box margin={{ top: 'l' }}>
+          <Box margin={{ top: "l" }}>
             <Header variant="h3">
-              Selected sources ({selectedTables.length} entr{selectedTables.length !== 1 ? 'ies' : 'y'})
+              Selected sources ({selectedTables.length} entr
+              {selectedTables.length !== 1 ? "ies" : "y"})
             </Header>
             <SpaceBetween size="m">
               {selectedTables.map((t) => (
@@ -374,13 +432,36 @@ export default function SelectDataSources({ user }) {
                   <Table
                     variant="embedded"
                     columnDefinitions={[
-                      { id: 'dataSource', header: 'Data source', cell: (item) => item.dataSource || 'AwsDataCatalog' },
-                      { id: 'catalogId',  header: 'Catalog',     cell: (item) => item.catalogId || 'AWSDataCatalog' },
-                      { id: 'database',   header: 'Database',    cell: (item) => item.databaseName },
-                      { id: 'table',      header: 'Table',       cell: (item) => item.tableName || <Box color="text-status-inactive">All tables</Box> },
+                      {
+                        id: "dataSource",
+                        header: "Data source",
+                        cell: (item) => item.dataSource || "AwsDataCatalog",
+                      },
+                      {
+                        id: "catalogId",
+                        header: "Catalog",
+                        cell: (item) => item.catalogId || "AWSDataCatalog",
+                      },
+                      {
+                        id: "database",
+                        header: "Database",
+                        cell: (item) => item.databaseName,
+                      },
+                      {
+                        id: "table",
+                        header: "Table",
+                        cell: (item) =>
+                          item.tableName || (
+                            <Box color="text-status-inactive">All tables</Box>
+                          ),
+                      },
                     ]}
                     items={[t]}
-                    empty={<Box color="text-status-inactive">No sources selected</Box>}
+                    empty={
+                      <Box color="text-status-inactive">
+                        No sources selected
+                      </Box>
+                    }
                   />
                 </Box>
               ))}
@@ -399,9 +480,7 @@ export default function SelectDataSources({ user }) {
           </Header>
         }
       >
-        <FormField
-          description="Upload existing semantic metadata, taxonomies, data dictionaries, or any documentation that provides context about your data sources"
-        >
+        <FormField description="Upload existing semantic metadata, taxonomies, data dictionaries, or any documentation that provides context about your data sources">
           <FileUpload
             value={ontologyFile}
             onChange={({ detail }) => setOntologyFile(detail.value)}
@@ -411,12 +490,13 @@ export default function SelectDataSources({ user }) {
             showFileSize
             showFileLastModified
             i18nStrings={{
-              uploadButtonText: e => e ? "Choose files" : "Choose file",
-              dropzoneText: e => e ? "Drop files to upload" : "Drop file to upload",
-              removeFileAriaLabel: e => `Remove file ${e + 1}`,
+              uploadButtonText: (e) => (e ? "Choose files" : "Choose file"),
+              dropzoneText: (e) =>
+                e ? "Drop files to upload" : "Drop file to upload",
+              removeFileAriaLabel: (e) => `Remove file ${e + 1}`,
               limitShowFewer: "Show fewer files",
               limitShowMore: "Show more files",
-              errorIconAriaLabel: "Error"
+              errorIconAriaLabel: "Error",
             }}
           >
             Choose files

@@ -1,0 +1,288 @@
+"""Unit tests for the Tier 1 pre-check → Tier 2 VKG graph-workflow cascade.
+
+The old 3-tier cascade (Tier 2 slice/query → Tier 3 supervised worker) was
+replaced by a single Strands graph workflow (Phase 1→5). These tests assert:
+  * Tier 1 still short-circuits on a governed-metric hit.
+  * A Tier 1 miss routes into the Tier 2 VKG workflow (``tier2_resolve``).
+  * The workflow's degraded paths and clarification produce a graceful answer
+    rather than a 5xx.
+"""
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+from agents.ontology_query_agent import main
+from agents.shared.metric_lookup import MetricMatch
+from agents.shared.tier2_graph import WorkflowContext
+
+
+def _stub_metadata(monkeypatch):
+    monkeypatch.setattr(main, "get_latest_metadata_item",
+                        lambda _id: {"name": "demo", "namespace": "ns-default"})
+
+
+def test_tier1_short_circuits_when_metric_matches(monkeypatch):
+    _stub_metadata(monkeypatch)
+    fake_metric = MagicMock(metric_id="monthly_revenue", supported_filters=[],
+                            supported_dimensions=[], compiled_sql="SELECT 1",
+                            dialect="athena")
+    monkeypatch.setattr(
+        main, "tier1_lookup",
+        lambda **_: MetricMatch(matched=fake_metric, matched_score=0.91),
+    )
+    monkeypatch.setattr(main, "tier1_execute",
+                        lambda **_: {"columns": ["x"], "rows": [{"x": 1}],
+                                     "metric_id": "monthly_revenue"})
+    spy_tier2 = MagicMock()
+    monkeypatch.setattr(main, "tier2_resolve", spy_tier2)
+
+    out = main._run_query({"question": "monthly revenue", "id": "ont-1"})
+
+    spy_tier2.assert_not_called()
+    assert "monthly_revenue" in str(out)
+
+
+def test_tier1_miss_routes_into_tier2_workflow(monkeypatch):
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    wf = WorkflowContext(question="q", namespace="ns",
+                         candidates=["ex:Policy"], sql="SELECT ?p WHERE { ?p a ex:Policy }",
+                         execution_result={"columns": ["p"], "rows": [["1"]],
+                                           "answer": "1 policy",
+                                           "n_quads": ["<a> <b> <c> ."]})
+    spy = MagicMock(return_value=wf)
+    monkeypatch.setattr(main, "tier2_resolve", spy)
+
+    out = main._run_query({"question": "list policies", "id": "ont-1"})
+
+    spy.assert_called_once()
+    assert out["sql_query"] == "SELECT ?p WHERE { ?p a ex:Policy }"
+    assert out["results"] == [{"p": "1"}]
+    assert out["n_quads"] == ["<a> <b> <c> ."]
+
+
+def test_tier2_clarification_short_circuits(monkeypatch):
+    """Phase 2 / 3b clarification → needs_clarification payload, no 5xx."""
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    wf = WorkflowContext(question="q", namespace="ns",
+                         candidates=["ex:A", "ex:B"],
+                         needs_clarification={
+                             "needs_clarification": True,
+                             "clarification_question": "Which one?",
+                             "options": [{"id": "a", "label": "A"}]},
+                         clarification_source="phase2")
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock(return_value=wf))
+
+    out = main._run_query({"question": "ambiguous", "id": "ont-1"})
+
+    assert out["needs_clarification"] is True
+    assert out["answer"] == "Which one?"
+
+
+def test_tier2_degraded_grounding_unresolved(monkeypatch):
+    """Grounding ceiling hit → graceful explanation, never executes/5xx."""
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    wf = WorkflowContext(question="q", namespace="ns",
+                         candidates=["ex:A"], sql="SELECT ?x WHERE { ?x ex:bad ?y }",
+                         degraded="grounding_unresolved")
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock(return_value=wf))
+
+    out = main._run_query({"question": "x", "id": "ont-1"})
+
+    assert "error" not in out
+    assert "grounded" in out["answer"].lower()
+
+
+def test_tier2_degraded_sparql_repair_failed(monkeypatch):
+    """SPARQL repair exhausted → graceful explanation, never 5xx."""
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    wf = WorkflowContext(question="q", namespace="ns",
+                         candidates=["ex:A"], degraded="sparql_repair_failed")
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock(return_value=wf))
+
+    out = main._run_query({"question": "x", "id": "ont-1"})
+
+    assert "error" not in out
+    assert "sparql" in out["answer"].lower()
+
+
+def test_tier3_recovery_stamps_agentic_provenance(monkeypatch):
+    """A Tier-3-rescued answer reports tier "agentic", not "vkg".
+
+    The monitoring tab buckets answered turns by ``provenance.tier``. Tier 3
+    success also clears ``degraded``, so if the tier stayed "vkg" a rescued turn
+    would be indistinguishable from a clean Tier 2 run and the agentic layer
+    would read as permanently unused.
+    """
+    from agents.ontology_query_agent.tier3.supervisor import SupervisorOutcome
+
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    wf = WorkflowContext(question="q", namespace="ns", candidates=["ex:A"],
+                         degraded="sparql_repair_failed")
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock(return_value=wf))
+    monkeypatch.setattr(main, "_run_tier3_supervisor", lambda **_: SupervisorOutcome(
+        ran=True, accepted=True, answer="3 policies",
+        query="SELECT ?p WHERE { ?p a ex:Policy }",
+        results=[["3"]], columns=["c"], rounds=2,
+    ))
+
+    out = main._run_query({"question": "x", "id": "ont-1"})
+
+    assert out["executionMode"] == "agentic"
+    assert out["provenance"]["tier"] == "agentic"
+    # Judge-accepted, so the turn is no longer degraded.
+    assert out["provenance"]["degraded"] is None
+    assert out["answer"] == "3 policies"
+
+
+def test_tier3_non_recovery_keeps_vkg_provenance(monkeypatch):
+    """Tier 3 that fails to recover leaves the Tier 2 degraded answer AND tier.
+
+    Only a judge-ACCEPTED rescue counts as agentic; a failed escalation must not
+    inflate the agentic bucket.
+    """
+    from agents.ontology_query_agent.tier3.supervisor import SupervisorOutcome
+
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    wf = WorkflowContext(question="q", namespace="ns", candidates=["ex:A"],
+                         degraded="sparql_repair_failed")
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock(return_value=wf))
+    monkeypatch.setattr(main, "_run_tier3_supervisor", lambda **_: SupervisorOutcome(
+        ran=True, accepted=False, rounds=3, reason="max_rounds",
+    ))
+
+    out = main._run_query({"question": "x", "id": "ont-1"})
+
+    assert out["executionMode"] == "workflow"
+    assert out["provenance"]["tier"] == "vkg"
+    assert out["provenance"]["degraded"] == "sparql_repair_failed"
+
+
+def test_tier2_workflow_exception_returns_error_not_raise(monkeypatch):
+    """An unexpected workflow error degrades to an error answer, not a crash."""
+    _stub_metadata(monkeypatch)
+    monkeypatch.setattr(main, "tier1_lookup", lambda **_: MetricMatch())
+    monkeypatch.setattr(main, "tier2_resolve",
+                        MagicMock(side_effect=RuntimeError("neptune timeout")))
+
+    out = main._run_query({"question": "x", "id": "ont-1"})
+
+    assert "error" in out
+
+
+def test_ontology_advisory_chunks_from_class_annotations(monkeypatch):
+    """The VKG advisory KB is built from the ontology's class annotations
+    (rdfs:comment + the curated vkg:* sections). A class with no description or
+    annotations is skipped; newline escapes are unescaped for display."""
+    import json
+    monkeypatch.setitem(main._ontology_cache, "ont-x", json.dumps({
+        "classes": {
+            "http://ex/ontology/Coverage": {
+                "label": "Coverage",
+                "comment": "A coverage on a policy holding.",
+                "businessPurpose": "Tracks what risks a policy insures.",
+                "commonQueryPatterns": "count coverages by type\\ntotal sum insured",
+            },
+            "http://ex/ontology/EmptyClass": {"label": "Empty"},
+        },
+    }))
+    out = json.loads(main._ontology_advisory_chunks(ontology_id="ont-x", namespace="ns"))
+    ctx = out["context"]
+    # EmptyClass (no description/annotations) is skipped.
+    assert len(ctx) == 1
+    content = ctx[0]["content"]
+    assert "# Coverage" in content
+    assert "## Business Purpose" in content
+    assert "## Common Query Patterns" in content
+    # N-Quads \n escapes are unescaped into real newlines.
+    assert "count coverages by type\ntotal sum insured" in content
+    assert "\\n" not in content
+    assert ctx[0]["metadata"]["class"] == "Coverage"
+
+
+def test_ontology_advisory_chunks_failsoft_on_empty(monkeypatch):
+    """No ontology / gateway unavailable → empty context (advisory falls back to
+    metrics-only), never raises."""
+    import json
+    monkeypatch.setattr(main, "_neptune_gateway_mcp", lambda: None)
+    # Cache miss + no gateway → {"context": []}, not an exception.
+    out = json.loads(main._ontology_advisory_chunks(ontology_id="absent", namespace="ns"))
+    assert out == {"context": []}
+
+
+def test_unbound_filter_falls_through_to_tier2_with_related_metric(monkeypatch):
+    """A scoped question against a filterable metric must NOT answer at Tier 1.
+
+    THE BUG this branch fixes: the metric matched semantically, but nothing bound
+    its declared ``region`` filter, so executing its compiled SQL would return the
+    GLOBAL number under a green "Governed Metric" badge.
+    """
+    _stub_metadata(monkeypatch)
+    # Real strings, not MagicMock auto-attributes: metric_ref puts these straight
+    # into provenance, which is JSON-serialized onto the SSE frame.
+    metric = SimpleNamespace(
+        metric_id="net_revenue", name="Net Revenue (TTM)",
+        description="gross - returns", lifecycle="PUBLISHED", version=3,
+        supported_filters=["region"], supported_dimensions=[],
+        allowed_values=None, compiled_sql="SELECT sum(amt) FROM t",
+        dialect="athena",
+    )
+    monkeypatch.setattr(
+        main, "tier1_lookup",
+        lambda **_: MetricMatch(matched=metric, matched_score=0.91),
+    )
+    executed = []
+    monkeypatch.setattr(main, "tier1_execute", lambda **kw: executed.append(kw))
+    wf = WorkflowContext(
+        question="q", namespace="ns", candidates=["ex:Sale"],
+        sql="SELECT ?s WHERE { ?s a ex:Sale }",
+        execution_result={"columns": ["s"], "rows": [["1"]],
+                          "answer": "1 row", "n_quads": []},
+    )
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock(return_value=wf))
+
+    out = main._run_query(
+        {"question": "net revenue for the EMEA region", "id": "ont-1"},
+    )
+
+    assert executed == [], "Tier 1 must not run when scope is undetermined"
+    prov = out["provenance"]
+    assert prov["tier"] != "governed_metric"
+    assert prov["related_metrics"][0]["reason"] == "unbound_parameter"
+    assert prov["related_metrics"][0]["metric_id"] == "net_revenue"
+
+
+def test_tier1_hit_states_the_scope_it_applied(monkeypatch):
+    """A bound filter executes SCOPED and provenance states the binding."""
+    _stub_metadata(monkeypatch)
+    metric = SimpleNamespace(
+        metric_id="net_revenue", name="Net Revenue (TTM)",
+        description="gross - returns", lifecycle="PUBLISHED", version=3,
+        supported_filters=["region"], supported_dimensions=[],
+        allowed_values={"region": ["EMEA", "AMER"]},
+        compiled_sql="SELECT sum(amt) AS total FROM t", dialect="athena",
+    )
+    monkeypatch.setattr(
+        main, "tier1_lookup",
+        lambda **_: MetricMatch(matched=metric, matched_score=0.91),
+    )
+    seen = {}
+
+    def _execute(**kw):
+        seen.update(kw)
+        return {"columns": ["total"], "rows": [{"total": "42"}],
+                "metric_id": "net_revenue"}
+
+    monkeypatch.setattr(main, "tier1_execute", _execute)
+    monkeypatch.setattr(main, "tier2_resolve", MagicMock())
+
+    out = main._run_query({"question": "net revenue in EMEA", "id": "ont-1"})
+
+    assert seen["filters"] == {"region": "EMEA"}, "must execute scoped"
+    assert out["provenance"]["metric"]["binding"] == {
+        "bound": {"region": "EMEA"}, "group_by": [],
+    }

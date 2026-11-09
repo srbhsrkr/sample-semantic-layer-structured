@@ -11,23 +11,38 @@ Usage:
 
 import os
 import sys
-import glob
+import logging
 import argparse
 from pathlib import Path
-from typing import Dict, List, Set, Optional
-import json
+from typing import Dict, List, Optional
+
+# rdflib's RDF/XML reader writes a "does not look like a valid URI" warning
+# to stderr for every FIBO file that uses an XML DOCTYPE with <!ENTITY>
+# declarations (i.e. all of them). Parsing still succeeds — the message is
+# pure noise when processing FIBO. Silence rdflib's own logger and the
+# urllib used by RDF/XML; real errors still propagate via exceptions.
+logging.getLogger("rdflib").setLevel(logging.ERROR)
+logging.getLogger("rdflib.term").setLevel(logging.ERROR)
 
 try:
-    from rdflib import Graph, Namespace, URIRef, Literal
+    from rdflib import BNode, Graph, Namespace, URIRef
     from rdflib.namespace import RDF, RDFS, OWL, SKOS, DCTERMS
 except ImportError:
     print("ERROR: rdflib not installed. Install with: pip install rdflib")
     sys.exit(1)
 
+# Domain-specific annotation vocabularies that carry richer documentation than
+# rdfs:comment alone (FIBO/Commons examples, explanatory notes, usage notes).
+CMNS_AV = Namespace("https://www.omg.org/spec/Commons/AnnotationVocabulary/")
+VANN = Namespace("http://purl.org/vocab/vann/")
+
 try:
-    import defusedxml
-    defusedxml.defuse_stdlib()  # patches stdlib xml modules
-    from lxml import etree  # nosec B410 — lxml is required for XPath; all parse calls use a hardened XMLParser (resolve_entities=False, no_network=True, load_dtd=False)
+    # NOTE: do NOT call defusedxml.defuse_stdlib() — it globally blocks XML
+    # entity resolution, which breaks rdflib parsing of FIBO RDF/XML files
+    # (every FIBO file declares <!ENTITY> shortcuts in its DOCTYPE). XSD
+    # parsing below uses a per-call hardened lxml.XMLParser instead, which
+    # gives the same security guarantees without the global side effect.
+    from lxml import etree  # nosec B410 — all parse calls below use a hardened XMLParser (resolve_entities=False, no_network=True, load_dtd=False)
     HAS_LXML = True
 except ImportError:
     print("WARNING: lxml not installed. XSD parsing disabled. Install with: pip install lxml")
@@ -37,13 +52,32 @@ except ImportError:
 class OntologyConverter:
     """Converts RDF/OWL ontologies to Markdown documentation"""
 
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, skip_empty: bool = True,
+                 emit_imports: bool = True):
+        """Create a converter.
+
+        Args:
+            verbose: print per-file progress.
+            skip_empty: when True, do not emit a markdown file for source RDF
+                that declares no classes and no properties (typical of FIBO
+                "load" / "All*" / "Metadata*" aggregator files that only
+                contain owl:imports). These produced 6-line stub markdowns
+                that diluted KB retrieval.
+            emit_imports: when True, emit a sibling `<name>-imports.md` for
+                ontology files that have owl:imports declarations, so the KB
+                retains the FIBO module dependency graph.
+        """
         self.verbose = verbose
+        self.skip_empty = skip_empty
+        self.emit_imports = emit_imports
         self.stats = {
             'files_processed': 0,
             'files_failed': 0,
+            'files_skipped_empty': 0,
+            'imports_files_emitted': 0,
             'classes_extracted': 0,
             'properties_extracted': 0,
+            'restrictions_extracted': 0,
         }
 
     def log(self, message: str):
@@ -74,7 +108,7 @@ class OntologyConverter:
 
             self.log(f"  Loaded {len(g)} triples")
 
-            # Extract ontology metadata
+            # Extract ontology metadata (incl. imports)
             ontology_info = self._extract_ontology_metadata(g)
 
             # Extract classes
@@ -82,6 +116,26 @@ class OntologyConverter:
 
             # Extract properties
             properties = self._extract_properties(g)
+
+            # Skip stub aggregator files (e.g. FIBO AllBE, Metadata*, AboutFIBO*).
+            # These have no semantic content of their own — only owl:imports —
+            # and produce 6-line markdowns that pollute KB retrieval.
+            has_imports = bool(ontology_info.get('imports'))
+            if self.skip_empty and not classes and not properties:
+                if has_imports and self.emit_imports:
+                    # Preserve the import graph as a dedicated module-deps doc
+                    # instead of a near-empty "Ontology Documentation" stub.
+                    imports_path = output_path.replace('.md', '-imports.md')
+                    os.makedirs(os.path.dirname(imports_path), exist_ok=True)
+                    with open(imports_path, 'w', encoding='utf-8') as f:
+                        f.write(self._generate_imports_markdown(ontology_info))
+                    self.stats['imports_files_emitted'] += 1
+                    self.log(f"  ↪ Aggregator ({len(ontology_info['imports'])} imports) — "
+                             f"emitted {os.path.basename(imports_path)}")
+                else:
+                    self.log("  ⏭  Skipped (no classes/properties)")
+                self.stats['files_skipped_empty'] += 1
+                return True
 
             # Generate Markdown
             markdown = self._generate_markdown(ontology_info, classes, properties)
@@ -91,9 +145,20 @@ class OntologyConverter:
             with open(output_path, 'w', encoding='utf-8') as f:
                 f.write(markdown)
 
+            # Optionally emit a companion imports doc next to non-empty modules
+            # so dependency context isn't lost.
+            if self.emit_imports and has_imports:
+                imports_path = output_path.replace('.md', '-imports.md')
+                with open(imports_path, 'w', encoding='utf-8') as f:
+                    f.write(self._generate_imports_markdown(ontology_info))
+                self.stats['imports_files_emitted'] += 1
+
             self.stats['files_processed'] += 1
             self.stats['classes_extracted'] += len(classes)
             self.stats['properties_extracted'] += len(properties)
+            self.stats['restrictions_extracted'] += sum(
+                len(c.get('restrictions', [])) for c in classes
+            )
 
             self.log(f"  ✓ Converted: {len(classes)} classes, {len(properties)} properties")
             return True
@@ -104,34 +169,47 @@ class OntologyConverter:
             return False
 
     def _extract_ontology_metadata(self, g: Graph) -> Dict:
-        """Extract ontology-level metadata"""
+        """Extract ontology-level metadata, including imports and abstract."""
         info = {
             'title': None,
             'description': None,
             'version': None,
             'namespace': None,
+            'imports': [],
+            'modified': None,
         }
 
         # Find ontology resource
         for ontology in g.subjects(RDF.type, OWL.Ontology):
-            # Get title
+            # Title: prefer rdfs:label, then dct:title
             for label in [RDFS.label, DCTERMS.title]:
                 title = g.value(ontology, label)
                 if title:
                     info['title'] = str(title)
                     break
 
-            # Get description
-            for desc in [RDFS.comment, DCTERMS.description]:
+            # Description: pull abstract first (FIBO uses dct:abstract heavily),
+            # then dct:description, then rdfs:comment.
+            for desc in [DCTERMS.abstract, DCTERMS.description, RDFS.comment]:
                 description = g.value(ontology, desc)
                 if description:
-                    info['description'] = str(description)
+                    info['description'] = str(description).strip()
                     break
 
-            # Get version
-            version = g.value(ontology, OWL.versionInfo)
+            # Version: owl:versionInfo or owl:versionIRI
+            version = g.value(ontology, OWL.versionInfo) or g.value(ontology, OWL.versionIRI)
             if version:
                 info['version'] = str(version)
+
+            modified = g.value(ontology, DCTERMS.modified)
+            if modified:
+                info['modified'] = str(modified)
+
+            # owl:imports — preserves the FIBO module dependency graph
+            for imp in g.objects(ontology, OWL.imports):
+                if isinstance(imp, URIRef):
+                    info['imports'].append(str(imp))
+            info['imports'].sort()
 
             info['namespace'] = str(ontology)
             break
@@ -139,7 +217,7 @@ class OntologyConverter:
         return info
 
     def _extract_classes(self, g: Graph) -> List[Dict]:
-        """Extract OWL classes"""
+        """Extract OWL classes with axioms (subclass, restrictions, equivalents)."""
         classes = []
 
         for cls in g.subjects(RDF.type, OWL.Class):
@@ -148,22 +226,117 @@ class OntologyConverter:
                     'uri': str(cls),
                     'label': self._get_label(g, cls),
                     'comment': self._get_comment(g, cls),
+                    'examples': self._get_examples(g, cls),
                     'subclass_of': [],
+                    'equivalent_to': [],
+                    'disjoint_with': [],
+                    'restrictions': [],
                     'properties': [],
                 }
 
-                # Get superclasses
+                # Superclasses: split named parents from anonymous restrictions
                 for parent in g.objects(cls, RDFS.subClassOf):
                     if isinstance(parent, URIRef):
                         class_info['subclass_of'].append(self._format_uri(parent))
+                    elif isinstance(parent, BNode):
+                        rest = self._format_restriction(g, parent)
+                        if rest:
+                            class_info['restrictions'].append(rest)
 
-                # Get properties with this class as domain
+                # Equivalent classes (named only — anonymous unions/intersections
+                # are common in FIBO; we capture a short summary).
+                for eq in g.objects(cls, OWL.equivalentClass):
+                    if isinstance(eq, URIRef):
+                        class_info['equivalent_to'].append(self._format_uri(eq))
+                    elif isinstance(eq, BNode):
+                        summary = self._format_class_expression(g, eq)
+                        if summary:
+                            class_info['equivalent_to'].append(summary)
+
+                # Disjoint classes
+                for d in g.objects(cls, OWL.disjointWith):
+                    if isinstance(d, URIRef):
+                        class_info['disjoint_with'].append(self._format_uri(d))
+
+                # Properties with this class as domain
                 for prop in g.subjects(RDFS.domain, cls):
                     class_info['properties'].append(self._get_label(g, prop))
 
                 classes.append(class_info)
 
         return sorted(classes, key=lambda x: x['label'])
+
+    def _format_restriction(self, g: Graph, node) -> Optional[str]:
+        """Render an owl:Restriction blank node as a human-readable line.
+
+        Examples produced:
+            on `hasIssuer` some Issuer
+            on `hasMaturityDate` exactly 1
+            on `hasCurrency` value USD
+        """
+        if (node, RDF.type, OWL.Restriction) not in g:
+            return None
+
+        on_prop = g.value(node, OWL.onProperty)
+        if on_prop is None:
+            return None
+        prop_label = self._format_uri(on_prop) if isinstance(on_prop, URIRef) else "(anonymous)"
+
+        # Quantifier-style restrictions
+        for kind, predicate in [
+            ('some', OWL.someValuesFrom),
+            ('only', OWL.allValuesFrom),
+            ('value', OWL.hasValue),
+        ]:
+            target = g.value(node, predicate)
+            if target is not None:
+                target_str = (self._format_uri(target) if isinstance(target, URIRef)
+                              else str(target))
+                return f"on `{prop_label}` {kind} {target_str}"
+
+        # Cardinality restrictions
+        for kind, predicate in [
+            ('exactly', OWL.cardinality),
+            ('exactly', OWL.qualifiedCardinality),
+            ('min', OWL.minCardinality),
+            ('min', OWL.minQualifiedCardinality),
+            ('max', OWL.maxCardinality),
+            ('max', OWL.maxQualifiedCardinality),
+        ]:
+            n = g.value(node, predicate)
+            if n is not None:
+                on_class = g.value(node, OWL.onClass) or g.value(node, OWL.onDataRange)
+                tail = ""
+                if isinstance(on_class, URIRef):
+                    tail = f" {self._format_uri(on_class)}"
+                return f"on `{prop_label}` {kind} {n}{tail}"
+
+        return f"on `{prop_label}` (unrecognized restriction)"
+
+    def _format_class_expression(self, g: Graph, node) -> Optional[str]:
+        """Render an anonymous class expression (union/intersection) compactly."""
+        for label, predicate, joiner in [
+            ('intersection', OWL.intersectionOf, ' AND '),
+            ('union', OWL.unionOf, ' OR '),
+        ]:
+            collection_head = g.value(node, predicate)
+            if collection_head is None:
+                continue
+            members = []
+            # rdf:List traversal
+            current = collection_head
+            while current and current != RDF.nil:
+                first = g.value(current, RDF.first)
+                if isinstance(first, URIRef):
+                    members.append(self._format_uri(first))
+                elif isinstance(first, BNode):
+                    sub = self._format_restriction(g, first) or self._format_class_expression(g, first)
+                    if sub:
+                        members.append(f"({sub})")
+                current = g.value(current, RDF.rest)
+            if members:
+                return f"{label}({joiner.join(members)})"
+        return None
 
     def _extract_properties(self, g: Graph) -> List[Dict]:
         """Extract OWL properties"""
@@ -184,7 +357,7 @@ class OntologyConverter:
         return sorted(properties, key=lambda x: x['label'])
 
     def _extract_property(self, g: Graph, prop: URIRef, prop_type: str) -> Dict:
-        """Extract information about a single property"""
+        """Extract information about a single property, including OWL characteristics."""
         info = {
             'uri': str(prop),
             'label': self._get_label(g, prop),
@@ -192,17 +365,41 @@ class OntologyConverter:
             'type': prop_type,
             'domain': [],
             'range': [],
+            'sub_property_of': [],
+            'inverse_of': [],
+            'characteristics': [],
         }
 
-        # Get domain
+        # Domain / range (named only — anonymous unions skipped)
         for domain in g.objects(prop, RDFS.domain):
             if isinstance(domain, URIRef):
                 info['domain'].append(self._format_uri(domain))
-
-        # Get range
         for range_cls in g.objects(prop, RDFS.range):
             if isinstance(range_cls, URIRef):
                 info['range'].append(self._format_uri(range_cls))
+
+        # Sub-property hierarchy
+        for parent in g.objects(prop, RDFS.subPropertyOf):
+            if isinstance(parent, URIRef):
+                info['sub_property_of'].append(self._format_uri(parent))
+
+        # Inverse-of
+        for inv in g.objects(prop, OWL.inverseOf):
+            if isinstance(inv, URIRef):
+                info['inverse_of'].append(self._format_uri(inv))
+
+        # OWL property characteristics
+        for char_iri, char_label in [
+            (OWL.FunctionalProperty, 'functional'),
+            (OWL.InverseFunctionalProperty, 'inverse-functional'),
+            (OWL.TransitiveProperty, 'transitive'),
+            (OWL.SymmetricProperty, 'symmetric'),
+            (OWL.AsymmetricProperty, 'asymmetric'),
+            (OWL.ReflexiveProperty, 'reflexive'),
+            (OWL.IrreflexiveProperty, 'irreflexive'),
+        ]:
+            if (prop, RDF.type, char_iri) in g:
+                info['characteristics'].append(char_label)
 
         return info
 
@@ -218,12 +415,32 @@ class OntologyConverter:
         return self._format_uri(resource)
 
     def _get_comment(self, g: Graph, resource: URIRef) -> str:
-        """Get comment/description for a resource"""
-        for comment_prop in [RDFS.comment, SKOS.definition, DCTERMS.description]:
+        """Get comment/definition for a resource.
+
+        FIBO frequently uses skos:definition (formal) plus rdfs:comment
+        (informal) plus cmns-av:explanatoryNote. Prefer the most formal
+        definition first, then fall back.
+        """
+        for comment_prop in [
+            SKOS.definition,
+            RDFS.comment,
+            DCTERMS.description,
+            CMNS_AV.explanatoryNote,
+        ]:
             comment = g.value(resource, comment_prop)
             if comment:
-                return str(comment)
+                return str(comment).strip()
         return ""
+
+    def _get_examples(self, g: Graph, resource: URIRef) -> List[str]:
+        """Pull worked examples / usage notes that supplement the definition."""
+        examples = []
+        for prop in [SKOS.example, CMNS_AV.example, CMNS_AV.usageNote, VANN.example]:
+            for value in g.objects(resource, prop):
+                text = str(value).strip()
+                if text:
+                    examples.append(text)
+        return examples
 
     def _format_uri(self, uri: URIRef) -> str:
         """Format URI to readable name"""
@@ -244,14 +461,27 @@ class OntologyConverter:
         md.append(f"# {title}\n")
 
         # Metadata
-        if info['description']:
+        if info.get('description'):
             md.append(f"{info['description']}\n")
 
-        if info['namespace']:
+        if info.get('namespace'):
             md.append(f"**Namespace**: `{info['namespace']}`\n")
 
-        if info['version']:
+        if info.get('version'):
             md.append(f"**Version**: {info['version']}\n")
+
+        if info.get('modified'):
+            md.append(f"**Modified**: {info['modified']}\n")
+
+        # Inline a compact imports list — full list also lives in the
+        # companion `<name>-imports.md` file when emit_imports is enabled.
+        imports = info.get('imports') or []
+        if imports:
+            md.append(f"\n**Imports** ({len(imports)}):\n")
+            for imp in imports[:15]:
+                md.append(f"- `{imp}`\n")
+            if len(imports) > 15:
+                md.append(f"- _(and {len(imports) - 15} more — see imports doc)_\n")
 
         md.append("\n---\n")
 
@@ -271,10 +501,28 @@ class OntologyConverter:
                 if cls['subclass_of']:
                     md.append(f"\n- **Subclass of**: {', '.join(cls['subclass_of'])}")
 
+                if cls.get('equivalent_to'):
+                    md.append(f"\n- **Equivalent to**: {', '.join(cls['equivalent_to'])}")
+
+                if cls.get('disjoint_with'):
+                    md.append(f"\n- **Disjoint with**: {', '.join(cls['disjoint_with'])}")
+
+                if cls.get('restrictions'):
+                    md.append("\n- **Restrictions**:")
+                    for rest in cls['restrictions'][:15]:
+                        md.append(f"\n  - {rest}")
+                    if len(cls['restrictions']) > 15:
+                        md.append(f"\n  - _(and {len(cls['restrictions']) - 15} more)_")
+
                 if cls['properties']:
                     md.append(f"\n- **Properties**: {', '.join(cls['properties'][:10])}")
                     if len(cls['properties']) > 10:
                         md.append(f" (and {len(cls['properties']) - 10} more)")
+
+                if cls.get('examples'):
+                    md.append("\n- **Examples**:")
+                    for ex in cls['examples'][:3]:
+                        md.append(f"\n  - {ex}")
 
                 md.append("\n")
 
@@ -298,9 +546,40 @@ class OntologyConverter:
                 if prop['range']:
                     md.append(f"\n- **Range**: {', '.join(prop['range'])}")
 
+                if prop.get('sub_property_of'):
+                    md.append(f"\n- **Sub-property of**: {', '.join(prop['sub_property_of'])}")
+
+                if prop.get('inverse_of'):
+                    md.append(f"\n- **Inverse of**: {', '.join(prop['inverse_of'])}")
+
+                if prop.get('characteristics'):
+                    md.append(f"\n- **Characteristics**: {', '.join(prop['characteristics'])}")
+
                 md.append("\n")
 
         return '\n'.join(md)
+
+    def _generate_imports_markdown(self, info: Dict) -> str:
+        """Render an `<ontology>-imports.md` documenting the owl:imports graph.
+
+        Aggregator files (FIBO AllBE, AboutFIBOProd, Metadata*) declare no
+        classes — only imports. Capturing the dependency list as a dedicated
+        markdown lets the KB answer questions like "which modules do I need
+        to load to use Bond?" without dumping noise into class/property
+        retrieval.
+        """
+        title = info.get('title') or 'Ontology Imports'
+        md = [f"# {title} — Module Imports\n"]
+        if info.get('namespace'):
+            md.append(f"**Namespace**: `{info['namespace']}`\n")
+        if info.get('description'):
+            md.append(f"\n{info['description']}\n")
+
+        imports = info.get('imports') or []
+        md.append(f"\nThis module imports {len(imports)} ontologies:\n\n")
+        for imp in imports:
+            md.append(f"- `{imp}`\n")
+        return ''.join(md)
 
 
 class XSDConverter:
@@ -634,8 +913,28 @@ def main():
                         help='Output directory for Markdown files (default: ../data/ontology-docs)')
     parser.add_argument('-v', '--verbose', action='store_true',
                         help='Verbose output')
+    parser.add_argument('--keep-empty', action='store_true',
+                        help='Keep stub markdowns for ontologies with no classes/properties '
+                             '(default: skip — these are typically aggregator files like '
+                             'FIBO All*, Metadata*, AboutFIBO* that only contain owl:imports)')
+    parser.add_argument('--no-imports', action='store_true',
+                        help='Do not emit companion <name>-imports.md docs for the '
+                             'owl:imports module dependency graph')
+    parser.add_argument('--exclude', action='append', default=[],
+                        metavar='PATH_FRAGMENT',
+                        help='Skip any source file whose path contains this substring. '
+                             'Can be repeated. Defaults include fibo-extracted/ (a stale '
+                             'duplicate-tree from earlier runs of download-ontologies.sh).')
 
     args = parser.parse_args()
+
+    # Always exclude fibo-extracted/ — it's a leftover duplicate of fibo/
+    # produced by older versions of download-ontologies.sh. Walking both
+    # trees produces duplicate markdowns.
+    exclude_fragments = list(args.exclude) + [
+        os.sep + 'fibo-extracted' + os.sep,
+        '/fibo-extracted/',
+    ]
 
     # Get absolute paths relative to script directory
     script_dir = Path(__file__).parent
@@ -670,19 +969,30 @@ def main():
     rdf_patterns = ['**/*.ttl', '**/*.rdf', '**/*.owl', '**/*.n3', '**/*.nt']
     xsd_patterns = ['**/*.xsd']
 
+    def _excluded(path: Path) -> bool:
+        sp = str(path)
+        return any(frag in sp for frag in exclude_fragments)
+
     rdf_files = []
     for pattern in rdf_patterns:
-        rdf_files.extend(input_dir.glob(pattern))
+        rdf_files.extend(p for p in input_dir.glob(pattern) if not _excluded(p))
 
     xsd_files = []
     for pattern in xsd_patterns:
-        xsd_files.extend(input_dir.glob(pattern))
+        xsd_files.extend(p for p in input_dir.glob(pattern) if not _excluded(p))
 
     total_files = len(rdf_files) + len(xsd_files)
-    print(f"Found {len(rdf_files)} RDF/OWL files and {len(xsd_files)} XSD files ({total_files} total)\n")
+    print(f"Found {len(rdf_files)} RDF/OWL files and {len(xsd_files)} XSD files ({total_files} total)")
+    if exclude_fragments:
+        print(f"  (excluding paths containing: {', '.join(sorted(set(exclude_fragments)))})")
+    print()
 
     # Convert files
-    rdf_converter = OntologyConverter(verbose=args.verbose)
+    rdf_converter = OntologyConverter(
+        verbose=args.verbose,
+        skip_empty=not args.keep_empty,
+        emit_imports=not args.no_imports,
+    )
     xsd_converter = XSDConverter(verbose=args.verbose)
 
     file_num = 1
@@ -719,9 +1029,12 @@ def main():
     # RDF/OWL Statistics
     print("\nRDF/OWL Ontologies:")
     print(f"  Files processed: {rdf_converter.stats['files_processed']}")
+    print(f"  Files skipped (empty/aggregator): {rdf_converter.stats['files_skipped_empty']}")
     print(f"  Files failed: {rdf_converter.stats['files_failed']}")
+    print(f"  Imports docs emitted: {rdf_converter.stats['imports_files_emitted']}")
     print(f"  Classes extracted: {rdf_converter.stats['classes_extracted']}")
     print(f"  Properties extracted: {rdf_converter.stats['properties_extracted']}")
+    print(f"  Restrictions extracted: {rdf_converter.stats['restrictions_extracted']}")
 
     # XSD Statistics
     print("\nXSD Schemas:")

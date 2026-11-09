@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from "react";
 import {
   Container,
   Header,
@@ -9,9 +9,15 @@ import {
   StatusIndicator,
   Modal,
   Alert,
-} from '@cloudscape-design/components';
-import { useNavigate } from 'react-router-dom';
-import { ontologyAPI } from '../../services/api';
+} from "@cloudscape-design/components";
+import { useNavigate } from "react-router-dom";
+import { ontologyAPI } from "../../services/api";
+
+// "Use Cases" descriptions vary from one line to many; clamp them to a fixed
+// number of lines (with an ellipsis) and reserve that height so every card is
+// the same size. LINE_HEIGHT_EM mirrors Cloudscape's body text line-height.
+const USE_CASES_MAX_LINES = 4;
+const USE_CASES_LINE_HEIGHT_EM = 1.4;
 
 export default function AdminDashboard({ user }) {
   const navigate = useNavigate();
@@ -52,7 +58,9 @@ export default function AdminDashboard({ user }) {
       const result = await ontologyAPI.deleteOntology(ontologyToDelete.id);
 
       if (result.success) {
-        setSuccess(`Semantic metadata "${ontologyToDelete.name || ontologyToDelete.id}" deleted successfully`);
+        setSuccess(
+          `Semantic metadata "${ontologyToDelete.name || ontologyToDelete.id}" deleted successfully`,
+        );
         setDeleteModalVisible(false);
         setOntologyToDelete(null);
         // Reload the ontologies list
@@ -60,10 +68,10 @@ export default function AdminDashboard({ user }) {
         // Clear success message after 3 seconds
         setTimeout(() => setSuccess(null), 3000);
       } else {
-        setError(result.error || 'Failed to delete ontology');
+        setError(result.error || "Failed to delete ontology");
       }
     } catch (err) {
-      setError(err.message || 'An error occurred while deleting');
+      setError(err.message || "An error occurred while deleting");
     } finally {
       setDeleting(false);
     }
@@ -77,55 +85,62 @@ export default function AdminDashboard({ user }) {
 
   const getStatusIndicator = (status) => {
     const statusMap = {
-      'draft': <StatusIndicator type="pending">Draft</StatusIndicator>,
-      'data_sources_selected': <StatusIndicator type="in-progress">Data Sources Selected</StatusIndicator>,
-      'metadata_extracted': <StatusIndicator type="in-progress">Metadata Extracted</StatusIndicator>,
-      'pending': <StatusIndicator type="loading">Pending</StatusIndicator>,
-      'processing': <StatusIndicator type="loading">Processing</StatusIndicator>,
-      'building': <StatusIndicator type="loading">Building</StatusIndicator>,
-      'built': <StatusIndicator type="success">Completed</StatusIndicator>,
-      'completed': <StatusIndicator type="success">Completed</StatusIndicator>,
-      'failed': <StatusIndicator type="error">Failed</StatusIndicator>,
+      draft: <StatusIndicator type="pending">Draft</StatusIndicator>,
+      data_sources_selected: (
+        <StatusIndicator type="in-progress">
+          Data Sources Selected
+        </StatusIndicator>
+      ),
+      metadata_extracted: (
+        <StatusIndicator type="in-progress">Metadata Extracted</StatusIndicator>
+      ),
+      pending: <StatusIndicator type="loading">Pending</StatusIndicator>,
+      processing: <StatusIndicator type="loading">Processing</StatusIndicator>,
+      building: <StatusIndicator type="loading">Building</StatusIndicator>,
+      built: <StatusIndicator type="success">Completed</StatusIndicator>,
+      completed: <StatusIndicator type="success">Completed</StatusIndicator>,
+      failed: <StatusIndicator type="error">Failed</StatusIndicator>,
     };
-    return statusMap[status] || <StatusIndicator type="info">{status}</StatusIndicator>;
+    return (
+      statusMap[status] || (
+        <StatusIndicator type="info">{status}</StatusIndicator>
+      )
+    );
   };
 
   const getActionButton = (item) => {
     const { status, id, type } = item;
 
     // Completed: show View button routed to the correct view page
-    if (status === 'completed' || status === 'built') {
-      const viewPath = type === 'VKG'
-        ? `/admin/view-graph?id=${id}`
-        : `/admin/view-semantic-metadata/${id}`;
-      return (
-        <Button onClick={() => navigate(viewPath)}>
-          View
-        </Button>
-      );
+    if (status === "completed" || status === "built") {
+      const viewPath =
+        type === "VKG"
+          ? `/admin/view-graph?id=${id}`
+          : `/admin/view-semantic-metadata/${id}`;
+      return <Button onClick={() => navigate(viewPath)}>View</Button>;
     }
 
     // Processing states: no action button
-    if (status === 'processing' || status === 'building' || status === 'pending') {
+    if (
+      status === "processing" ||
+      status === "building" ||
+      status === "pending"
+    ) {
       return null;
     }
 
     // All other statuses: link to the specific workflow page
     const continuePathMap = {
-      'draft': `/admin/describe-intent?id=${id}`,
-      'data_sources_selected': `/admin/review-metadata?id=${id}`,
-      'metadata_extracted': `/admin/select-semantic-layer-type/${id}`,
-      'failed': `/admin/describe-intent?id=${id}`,
+      draft: `/admin/describe-intent?id=${id}`,
+      data_sources_selected: `/admin/review-metadata?id=${id}`,
+      metadata_extracted: `/admin/select-semantic-layer-type/${id}`,
+      failed: `/admin/describe-intent?id=${id}`,
     };
 
     const continuePath = continuePathMap[status];
     if (continuePath) {
-      const label = status === 'failed' ? 'Retry' : 'Continue';
-      return (
-        <Button onClick={() => navigate(continuePath)}>
-          {label}
-        </Button>
-      );
+      const label = status === "failed" ? "Retry" : "Continue";
+      return <Button onClick={() => navigate(continuePath)}>{label}</Button>;
     }
 
     return null;
@@ -139,7 +154,7 @@ export default function AdminDashboard({ user }) {
         actions={
           <Button
             variant="primary"
-            onClick={() => navigate('/admin/describe-intent')}
+            onClick={() => navigate("/admin/describe-intent")}
           >
             Create New Semantic Metadata
           </Button>
@@ -160,18 +175,17 @@ export default function AdminDashboard({ user }) {
         </Alert>
       )}
 
-      <Container
-        header={
-          <Header variant="h2">Semantic Metadata</Header>
-        }
-      >
+      <Container header={<Header variant="h2">Semantic Metadata</Header>}>
         {loading ? (
           <Box textAlign="center" padding="l">
-            <StatusIndicator type="loading">Loading semantic metadata...</StatusIndicator>
+            <StatusIndicator type="loading">
+              Loading semantic metadata...
+            </StatusIndicator>
           </Box>
         ) : ontologies.length === 0 ? (
           <Box textAlign="center" padding="l" color="text-status-inactive">
-            No semantic metadata created yet. Click "Create New Semantic Metadata" to get started.
+            No semantic metadata created yet. Click "Create New Semantic
+            Metadata" to get started.
           </Box>
         ) : (
           <Cards
@@ -186,32 +200,53 @@ export default function AdminDashboard({ user }) {
               ),
               sections: [
                 {
-                  id: 'version',
-                  header: 'Version',
-                  content: (item) => item.latestVersion || 'v1',
+                  id: "version",
+                  header: "Version",
+                  content: (item) => item.latestVersion || "v1",
                 },
                 {
-                  id: 'status',
-                  header: 'Status',
+                  id: "status",
+                  header: "Status",
                   content: (item) => getStatusIndicator(item.status),
                 },
                 {
-                  id: 'use-cases',
-                  header: 'Use Cases',
-                  content: (item) => item.useCasesDescription || 'No use cases specified',
+                  id: "use-cases",
+                  header: "Use Cases",
+                  content: (item) => (
+                    // Clamp to a fixed number of lines so long descriptions are
+                    // abbreviated with an ellipsis, and reserve that height (minHeight)
+                    // so short descriptions occupy the same space — keeping every card
+                    // the same size regardless of text length. Full text on hover.
+                    <div
+                      title={item.useCasesDescription || undefined}
+                      style={{
+                        display: "-webkit-box",
+                        WebkitLineClamp: USE_CASES_MAX_LINES,
+                        WebkitBoxOrient: "vertical",
+                        overflow: "hidden",
+                        minHeight: `${USE_CASES_MAX_LINES * USE_CASES_LINE_HEIGHT_EM}em`,
+                        lineHeight: `${USE_CASES_LINE_HEIGHT_EM}em`,
+                      }}
+                    >
+                      {item.useCasesDescription || "No use cases specified"}
+                    </div>
+                  ),
                 },
                 {
-                  id: 'updated',
-                  header: 'Last Updated',
+                  id: "updated",
+                  header: "Last Updated",
                   content: (item) =>
                     item.updatedAt
-                      ? new Date(item.updatedAt).toLocaleDateString()
-                      : 'Unknown',
+                      ? new Date(item.updatedAt).toLocaleString()
+                      : "Unknown",
                 },
                 {
-                  id: 'actions',
+                  id: "actions",
                   content: (item) => (
                     <SpaceBetween direction="horizontal" size="xs">
+                      {/* Ground Truth + Evaluations moved into the layer's
+                          detail screen (View → tabs) so the overview stays
+                          focused on View / Continue / Delete. */}
                       {getActionButton(item)}
                       <Button
                         onClick={() => handleDeleteClick(item)}
@@ -261,7 +296,7 @@ export default function AdminDashboard({ user }) {
             </Alert>
           )}
           <Box>
-            Are you sure you want to delete the semantic metadata{' '}
+            Are you sure you want to delete the semantic metadata{" "}
             <strong>{ontologyToDelete?.name || ontologyToDelete?.id}</strong>?
           </Box>
           <Alert type="warning">

@@ -1,28 +1,42 @@
-import { Duration, CfnOutput, StackProps } from 'aws-cdk-lib';
+import { Duration, CfnOutput, RemovalPolicy, StackProps } from 'aws-cdk-lib';
 import {
   AccountRecovery,
   ClientAttributes,
   FeaturePlan,
+  OAuthScope,
+  ResourceServerScope,
   UserPool,
   UserPoolClient,
   UserPoolDomain,
   UserPoolGroup,
+  UserPoolResourceServer,
 } from 'aws-cdk-lib/aws-cognito';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import { IdentityPool, UserPoolAuthenticationProvider } from 'aws-cdk-lib/aws-cognito-identitypool';
 import { Effect, PolicyStatement } from 'aws-cdk-lib/aws-iam';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Function } from 'aws-cdk-lib/aws-lambda';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { CfnWebACL, CfnWebACLAssociation } from 'aws-cdk-lib/aws-wafv2';
 import { NagSuppressions } from 'cdk-nag';
 import { Construct } from 'constructs';
 import { FederateUserPool, FederateUserPoolClient } from '../../../common/constructs/federate';
 import { createManagedRules } from '../../../common/utilities';
 import { CommonStack } from '../../../common/constructs/stack';
+import { LakeFormationGroupGrants } from '../lf-groups';
+import {
+  MCP_RESOURCE_SERVER_ID,
+  MCP_INVOKE_SCOPE_NAME,
+  MCP_PKCE_CALLBACK_URLS,
+} from '../../../common/auth-constants';
 
 interface AuthStackProps extends StackProps {
   urls: string[];
   hydrationFunction?: Function;
+  /** Glue databases the per-group LF roles should be granted on. When
+   *  omitted the LF construct is not provisioned.
+   *  Wired by app.ts after the glue-catalog stack lands. */
+  lfGrantDatabases?: { readonly name: string; readonly catalogId?: string }[];
 }
 
 export class AuthStack extends CommonStack {
@@ -33,6 +47,29 @@ export class AuthStack extends CommonStack {
   public readonly regionalWebAclArn: string;
   public readonly authenticatedRole: iam.Role;
   public readonly authenticationMode: string;
+  public readonly lfGroupGrants?: LakeFormationGroupGrants;
+
+  // ---- AgentCore JWT/OAuth unification (2026-06-02) -----------------------
+  /** Hosted-UI domain for the OAuth proxy login + token endpoint. */
+  public readonly mcpHostedUiDomain: UserPoolDomain;
+  /** Resource server carrying the `semantic-layer-mcp/invoke` scope. */
+  public readonly mcpResourceServer: UserPoolResourceServer;
+  /** Public PKCE 3LO client for Claude Code / VSCode / Cursor MCP login. */
+  public readonly mcpClient: UserPoolClient;
+  /** Confidential machine-to-machine client (client_credentials) for backend
+   *  service-to-runtime calls (mcp-tools Lambda, REST generation jobs). */
+  public readonly m2mClient: UserPoolClient;
+  /** Secrets Manager secret holding the M2M client secret (backend callers read
+   *  this to build the client_credentials Basic-auth header). */
+  public readonly m2mClientSecret: secretsmanager.Secret;
+  /** Confidential authorization-code client for the strands-agent AgentCore
+   *  Gateway (mcp_server target). Mirrors mcpClient but with a secret —
+   *  AgentCore Identity requires a confidential client. */
+  public readonly agentcoreClient: UserPoolClient;
+  /** Secrets Manager secret holding the AgentCore auth-code client secret. */
+  public readonly agentcoreClientSecret: secretsmanager.Secret;
+  /** Cognito hosted-UI base URL; the OAuth token endpoint is `${url}/oauth2/token`. */
+  public readonly mcpHostedUiDomainUrl: string;
 
   constructor(scope: Construct, id: string, props: AuthStackProps) {
     super(scope, id, props);
@@ -42,6 +79,11 @@ export class AuthStack extends CommonStack {
     // Read feature flags from CDK context
     const enableDirectAuth = this.node.tryGetContext('enableDirectAuth') ?? true;
     const selfSignUpEnabled = this.node.tryGetContext('selfSignUpEnabled') ?? false; // default CLOSED — never allow self-signup unless explicitly set
+    // default FALSE — dev/demo deletes the user pool on `cdk destroy`. Pass
+    // `-c retainUserPool=true` for production so real accounts are preserved.
+    const retainUserPool =
+      this.node.tryGetContext('retainUserPool') === true ||
+      this.node.tryGetContext('retainUserPool') === 'true';
     this.authenticationMode = enableDirectAuth ? 'direct' : 'oauth';
 
     // Create Cognito User Pool
@@ -72,6 +114,9 @@ export class AuthStack extends CommonStack {
         postConfirmation: hydrationFunction,
       },
     });
+    // dev/demo: delete the pool on `cdk destroy`. For prod pass
+    // `-c retainUserPool=true` to keep RETAIN and preserve user accounts.
+    userPool.applyRemovalPolicy(retainUserPool ? RemovalPolicy.RETAIN : RemovalPolicy.DESTROY);
     NagSuppressions.addResourceSuppressions(userPool, [
       {
         id: 'AwsSolutions-COG2',
@@ -230,6 +275,132 @@ export class AuthStack extends CommonStack {
     this.identityPool = identityPool;
     this.regionalWebAclArn = regionalWebAclArn;
 
+    // ---- AgentCore JWT/OAuth unification (2026-06-02) --------------------
+    // See docs/plans/2026-06-02-agentcore-jwt-oauth-unification-design.md.
+    // Adds the identity primitives that let the WHOLE system speak JWT/OAuth:
+    //   * a hosted-UI domain (browser login for the MCP OAuth proxy + token endpoint),
+    //   * a resource server + `invoke` scope (validated by gateways + runtimes),
+    //   * a public PKCE 3LO client (Claude Code / VSCode / Cursor MCP login),
+    //   * a confidential M2M client (backend service-to-runtime calls, no user).
+    // The existing SPA web client + chat-gateway JWT config are untouched.
+
+    // Hosted-UI domain — prefix must be globally unique; derive from
+    // resourcePrefix + account and clamp to Cognito's 63-char limit.
+    const domainPrefix = `${this.resourcePrefix}-${this.account}`.toLowerCase().slice(0, 63);
+    this.mcpHostedUiDomain = userPool.addDomain('McpHostedUiDomain', {
+      cognitoDomain: { domainPrefix },
+    });
+
+    // Resource server + single custom scope (semantic-layer-mcp/invoke).
+    const invokeScope = new ResourceServerScope({
+      scopeName: MCP_INVOKE_SCOPE_NAME,
+      scopeDescription: 'Invoke semantic-layer MCP tools and AgentCore runtimes',
+    });
+    this.mcpResourceServer = userPool.addResourceServer('McpResourceServer', {
+      identifier: MCP_RESOURCE_SERVER_ID,
+      scopes: [invokeScope],
+    });
+
+    // Public PKCE 3LO client — no secret; authorization-code grant; loopback +
+    // vscode callbacks. The OAuth proxy appends its own /callback URL post-hoc.
+    this.mcpClient = userPool.addClient('McpPkceClient', {
+      userPoolClientName: `${this.resourcePrefix}-mcp`,
+      generateSecret: false,
+      accessTokenValidity: accessTokenValidity,
+      idTokenValidity: accessTokenValidity,
+      refreshTokenValidity: refreshTokenValidity,
+      authFlows: { userSrp: true },
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [
+          OAuthScope.OPENID,
+          OAuthScope.PROFILE,
+          OAuthScope.EMAIL,
+          OAuthScope.resourceServer(this.mcpResourceServer, invokeScope),
+        ],
+        callbackUrls: [...MCP_PKCE_CALLBACK_URLS],
+      },
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+    });
+
+    // Confidential M2M client — client_credentials grant + invoke scope. Used by
+    // backend Lambdas (mcp-tools, REST generation jobs) that invoke runtimes with
+    // no end-user context. The secret is read from the auto-generated client
+    // secret (exposed via the SDK at runtime through DescribeUserPoolClient, or
+    // surfaced to callers per the proxy/runtime caller wiring).
+    this.m2mClient = userPool.addClient('M2mClient', {
+      userPoolClientName: `${this.resourcePrefix}-m2m`,
+      generateSecret: true,
+      accessTokenValidity: accessTokenValidity,
+      authFlows: {},
+      oAuth: {
+        flows: { clientCredentials: true },
+        scopes: [OAuthScope.resourceServer(this.mcpResourceServer, invokeScope)],
+      },
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+    });
+
+    // Surface the M2M client secret into Secrets Manager so backend callers
+    // (mcp-tools Lambda, REST) can read it at runtime with a least-privilege
+    // grant. `userPoolClientSecret` is a CDK SecretValue resolvable at deploy.
+    this.m2mClientSecret = new secretsmanager.Secret(this, 'M2mClientSecret', {
+      secretName: `/${this.resourcePrefix}/m2m-client-secret`,
+      description: 'Cognito M2M (client_credentials) app-client secret for AgentCore calls',
+      secretStringValue: this.m2mClient.userPoolClientSecret,
+    });
+    NagSuppressions.addResourceSuppressions(this.m2mClientSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason:
+          'This secret mirrors the Cognito app-client secret (a managed value); Secrets Manager ' +
+          'rotation cannot regenerate a Cognito client secret, so automatic rotation is not applicable. ' +
+          'Rotate by recreating the app client if ever compromised.',
+      },
+    ]);
+
+    // Confidential authorization-code client for the strands-agent AgentCore
+    // Gateway (mcp_server target). Like mcpClient but generateSecret: true —
+    // AgentCore Identity needs a confidential client.
+    this.agentcoreClient = userPool.addClient('AgentcoreAuthCodeClient', {
+      userPoolClientName: `${this.resourcePrefix}-agentcore`,
+      generateSecret: true,
+      accessTokenValidity: accessTokenValidity,
+      idTokenValidity: accessTokenValidity,
+      refreshTokenValidity: refreshTokenValidity,
+      authFlows: { userSrp: true },
+      oAuth: {
+        flows: { authorizationCodeGrant: true },
+        scopes: [OAuthScope.OPENID, OAuthScope.resourceServer(this.mcpResourceServer, invokeScope)],
+        // Placeholder; the real AgentCore callback URL is added in Phase 3 of
+        // SEMANTIC_LAYER_SETUP.md once the credential provider mints it.
+        callbackUrls: ['https://localhost/oauth-complete'],
+      },
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+    });
+
+    // Mirror the secret into Secrets Manager (same pattern as m2mClientSecret).
+    this.agentcoreClientSecret = new secretsmanager.Secret(this, 'AgentcoreClientSecret', {
+      secretName: `/${this.resourcePrefix}/agentcore-client-secret`,
+      description: 'Confidential auth-code client secret for the strands-agent AgentCore Gateway',
+      secretStringValue: this.agentcoreClient.userPoolClientSecret,
+    });
+    NagSuppressions.addResourceSuppressions(this.agentcoreClientSecret, [
+      {
+        id: 'AwsSolutions-SMG4',
+        reason:
+          'This secret mirrors the Cognito app-client secret (a managed value); Secrets Manager ' +
+          'rotation cannot regenerate a Cognito client secret, so automatic rotation is not applicable. ' +
+          'Rotate by recreating the app client if ever compromised.',
+      },
+    ]);
+
+    new CfnOutput(this, 'AgentcoreAuthCodeClientId', {
+      value: this.agentcoreClient.userPoolClientId,
+      description: 'Confidential auth-code client id for the strands-agent AgentCore Gateway',
+    });
+
+    this.mcpHostedUiDomainUrl = `https://${domainPrefix}.auth.${this.region}.amazoncognito.com`;
+
     // Create authenticated role
     this.authenticatedRole = new iam.Role(this, `${this.resourcePrefix}-AuthenticatedRole`, {
       assumedBy: new iam.FederatedPrincipal(
@@ -278,6 +449,15 @@ export class AuthStack extends CommonStack {
       roleMappings: {},
     });
 
+    // ---- Per-group LF grants (item #4 OBO migration) ----
+    if (props.lfGrantDatabases && props.lfGrantDatabases.length > 0) {
+      this.lfGroupGrants = new LakeFormationGroupGrants(this, 'LfGroupGrants', {
+        userPool: this.userPool,
+        databases: props.lfGrantDatabases,
+        identityPoolId: this.identityPool.identityPoolId,
+      });
+    }
+
     // Outputs
     new CfnOutput(this, `${this.resourcePrefix}-UserPoolId`, {
       value: this.userPool.userPoolId,
@@ -294,6 +474,20 @@ export class AuthStack extends CommonStack {
     new CfnOutput(this, `${this.resourcePrefix}-AuthenticationMode`, {
       value: enableDirectAuth ? 'direct' : 'oauth',
       description: 'Authentication mode: oauth (Midway) or direct (Cognito)',
+    });
+
+    // ---- AgentCore JWT/OAuth unification outputs ------------------------
+    new CfnOutput(this, 'McpHostedUiDomainUrl', {
+      value: `https://${domainPrefix}.auth.${this.region}.amazoncognito.com`,
+      description: 'Cognito hosted-UI domain base URL (login + /oauth2/token)',
+    });
+    new CfnOutput(this, 'McpPkceClientId', {
+      value: this.mcpClient.userPoolClientId,
+      description: 'Public PKCE 3LO client id for Claude Code / VSCode MCP login',
+    });
+    new CfnOutput(this, 'M2mClientId', {
+      value: this.m2mClient.userPoolClientId,
+      description: 'Confidential M2M client id (client_credentials) for backend runtime calls',
     });
   }
 

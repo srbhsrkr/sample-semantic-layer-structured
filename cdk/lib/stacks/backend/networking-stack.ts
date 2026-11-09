@@ -101,6 +101,18 @@ export class NetworkingStack extends cdk.Stack {
       service: ec2.InterfaceVpcEndpointAwsService.BEDROCK_AGENTCORE,
     });
 
+    // AgentCore Gateway dataplane — separate VPC endpoint service from bedrock-agentcore
+    // (control plane). Required for runtimes calling MCP tools at
+    // *.gateway.bedrock-agentcore.<region>.amazonaws.com — without this, in-VPC runtimes
+    // get "Name or service not known" when invoking the Neptune/MCP gateways.
+    this.vpc.addInterfaceEndpoint('BedrockAgentCoreGatewayEndpoint', {
+      service: new ec2.InterfaceVpcEndpointService(
+        `com.amazonaws.${this.region}.bedrock-agentcore.gateway`,
+        443
+      ),
+      privateDnsEnabled: true,
+    });
+
     // Bedrock Agent / Agent Runtime — used by KB ingestion and retrieval tools
     this.vpc.addInterfaceEndpoint('BedrockAgentEndpoint', {
       service: ec2.InterfaceVpcEndpointAwsService.BEDROCK_AGENT,

@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect } from "react";
 import {
   Container,
   Header,
@@ -9,18 +9,19 @@ import {
   Button,
   Alert,
   Box,
-} from '@cloudscape-design/components';
-import { useNavigate, useSearchParams } from 'react-router-dom';
-import { ontologyAPI } from '../../services/api';
+} from "@cloudscape-design/components";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { ontologyAPI } from "../../services/api";
+import CancelDraftButton from "../../components/CancelDraftButton";
 
 export default function DescribeIntent({ user }) {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const id = searchParams.get('id');
+  const id = searchParams.get("id");
 
-  const [name, setName] = useState('');
-  const [dataSourcesDescription, setDataSourcesDescription] = useState('');
-  const [useCasesDescription, setUseCasesDescription] = useState('');
+  const [name, setName] = useState("");
+  const [dataSourcesDescription, setDataSourcesDescription] = useState("");
+  const [useCasesDescription, setUseCasesDescription] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [success, setSuccess] = useState(false);
@@ -34,9 +35,9 @@ export default function DescribeIntent({ user }) {
   const loadExistingConfig = async () => {
     const result = await ontologyAPI.getOntologyConfig(id);
     if (result.success && result.data) {
-      setName(result.data.name || '');
-      setDataSourcesDescription(result.data.dataSourcesDescription || '');
-      setUseCasesDescription(result.data.useCasesDescription || '');
+      setName(result.data.name || "");
+      setDataSourcesDescription(result.data.dataSourcesDescription || "");
+      setUseCasesDescription(result.data.useCasesDescription || "");
     }
   };
 
@@ -47,14 +48,14 @@ export default function DescribeIntent({ user }) {
 
     try {
       // Normalize name: lowercase and remove all spaces
-      const normalizedName = name.toLowerCase().replace(/\s+/g, '');
+      const normalizedName = name.toLowerCase().replace(/\s+/g, "");
 
       const data = {
         name: normalizedName,
         dataSourcesDescription,
         useCasesDescription,
         createdBy: user?.email || user?.username,
-        status: 'draft',
+        status: "draft",
       };
 
       if (id) {
@@ -72,17 +73,21 @@ export default function DescribeIntent({ user }) {
           navigate(`/admin/select-datasources?id=${newOntologyId}`);
         }, 1500);
       } else {
-        setError(result.error || 'Failed to save configuration');
+        setError(result.error || "Failed to save configuration");
       }
     } catch (err) {
-      setError(err.message || 'An error occurred');
+      setError(err.message || "An error occurred");
     } finally {
       setLoading(false);
     }
   };
 
   const isFormValid = () => {
-    return name.trim().length > 0 && dataSourcesDescription.trim().length > 0 && useCasesDescription.trim().length > 0;
+    return (
+      name.trim().length > 0 &&
+      dataSourcesDescription.trim().length > 0 &&
+      useCasesDescription.trim().length > 0
+    );
   };
 
   return (
@@ -90,6 +95,7 @@ export default function DescribeIntent({ user }) {
       <Header
         variant="h1"
         description="Step 1 of 5: Describe your data sources and intended use cases"
+        actions={<CancelDraftButton ontologyId={id} />}
       >
         Describe Application Intent
       </Header>
@@ -146,9 +152,7 @@ export default function DescribeIntent({ user }) {
 
           <Box float="right">
             <SpaceBetween direction="horizontal" size="xs">
-              <Button onClick={() => navigate('/admin')}>
-                Cancel
-              </Button>
+              <Button onClick={() => navigate("/admin")}>Cancel</Button>
               <Button
                 variant="primary"
                 onClick={handleSubmit}
@@ -162,19 +166,15 @@ export default function DescribeIntent({ user }) {
         </SpaceBetween>
       </Container>
 
-      <Container
-        header={
-          <Header variant="h2">
-            Why This Matters
-          </Header>
-        }
-      >
+      <Container header={<Header variant="h2">Why This Matters</Header>}>
         <Box variant="p">
           Describing your data sources and use cases helps the system:
         </Box>
         <ul>
           <li>Understand the domain and context of your data</li>
-          <li>Generate appropriate semantic metadata patterns and relationships</li>
+          <li>
+            Generate appropriate semantic metadata patterns and relationships
+          </li>
           <li>Provide better natural language understanding</li>
         </ul>
       </Container>

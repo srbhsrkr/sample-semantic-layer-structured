@@ -18,6 +18,45 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
+# curl wrapper: fail on HTTP errors, follow redirects, retry transient failures,
+# require a non-empty body, and reject responses that are clearly HTML when an
+# RDF/turtle/XSD file was expected (servers like hl7.org reply with HTML
+# "300 Multiple Choices" pages for unknown extensions, which curl --fail
+# does NOT treat as an error).
+fetch() {
+    local url="$1"
+    local out="$2"
+    local label="${3:-$(basename "$out")}"
+    if curl --silent --show-error --location --fail \
+            --retry 3 --retry-delay 2 --retry-connrefused \
+            --max-time 60 \
+            "$url" -o "$out"; then
+        if [ ! -s "$out" ]; then
+            echo -e "${RED}    ✗ ${label}: empty response${NC}"
+            rm -f "$out"
+            return 1
+        fi
+        # Reject HTML payloads when we expected RDF/TTL/XSD/OWL.
+        case "$out" in
+            *.ttl|*.rdf|*.owl|*.n3|*.nt|*.xsd)
+                local first
+                first="$(head -c 256 "$out" | tr -d '\n' | tr '[:upper:]' '[:lower:]')"
+                case "$first" in
+                    *'<!doctype html'*|*'<html'*)
+                        echo -e "${RED}    ✗ ${label}: server returned HTML (likely 'multiple choices' / 404 page)${NC}"
+                        rm -f "$out"
+                        return 1
+                        ;;
+                esac
+                ;;
+        esac
+        return 0
+    fi
+    echo -e "${RED}    ✗ ${label}: download failed (${url})${NC}"
+    rm -f "$out"
+    return 1
+}
+
 # Create output directories
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$TEMP_DIR"
@@ -44,28 +83,14 @@ else
     git clone --depth 1 --quiet https://github.com/edmcouncil/fibo.git "$OUTPUT_DIR/fibo"
 fi
 
-# Copy key FIBO modules to flat structure for easier processing
-mkdir -p "$OUTPUT_DIR/fibo-extracted"
-echo "  → Extracting key FIBO modules..."
-
-# Foundation (FND) - Core financial concepts
-if [ -d "$OUTPUT_DIR/fibo/FND" ]; then
-    cp -r "$OUTPUT_DIR/fibo/FND" "$OUTPUT_DIR/fibo-extracted/" 2>/dev/null || true
-fi
-
-# Business Entities (BE)
-if [ -d "$OUTPUT_DIR/fibo/BE" ]; then
-    cp -r "$OUTPUT_DIR/fibo/BE" "$OUTPUT_DIR/fibo-extracted/" 2>/dev/null || true
-fi
-
-# Financial Business and Commerce (FBC)
-if [ -d "$OUTPUT_DIR/fibo/FBC" ]; then
-    cp -r "$OUTPUT_DIR/fibo/FBC" "$OUTPUT_DIR/fibo-extracted/" 2>/dev/null || true
-fi
-
-# Indices and Indicators (IND) - relevant for insurance
-if [ -d "$OUTPUT_DIR/fibo/IND" ]; then
-    cp -r "$OUTPUT_DIR/fibo/IND" "$OUTPUT_DIR/fibo-extracted/" 2>/dev/null || true
+# NOTE: previously this step copied FND/BE/FBC/IND into a sibling
+# `fibo-extracted/` directory. The converter then walked both trees and
+# produced duplicate markdowns. The converter now recurses through
+# `$OUTPUT_DIR/fibo/` directly, so the copy is no longer needed.
+# Clean up any stale `fibo-extracted/` left over from earlier runs:
+if [ -d "$OUTPUT_DIR/fibo-extracted" ]; then
+    echo "  → Removing stale fibo-extracted/ (duplicates fibo/)..."
+    rm -rf "$OUTPUT_DIR/fibo-extracted"
 fi
 
 echo -e "${GREEN}  ✓ FIBO downloaded successfully${NC}"
@@ -80,14 +105,17 @@ mkdir -p "$OUTPUT_DIR/acord"
 # TXLife 2.36 — publicly available ACORD life insurance transaction schema
 # Source: https://github.com/jasonjanofsky/Acord60Mins
 echo "  → Downloading ACORD TXLife 2.36.00 schema..."
-curl -sL \
+if fetch \
     "https://raw.githubusercontent.com/jasonjanofsky/Acord60Mins/master/Acord60Mins/AcordTest/TXLife2.36.00.xsd" \
-    -o "$OUTPUT_DIR/acord/TXLife2.36.00.xsd"
-
-if [ -s "$OUTPUT_DIR/acord/TXLife2.36.00.xsd" ]; then
+    "$OUTPUT_DIR/acord/TXLife2.36.00.xsd" \
+    "TXLife2.36.00.xsd"; then
     echo -e "${GREEN}  ✓ TXLife2.36.00.xsd downloaded successfully${NC}"
-else
-    echo -e "${RED}  ✗ Download failed — file is empty or missing${NC}"
+fi
+
+# Remove any stray top-level copy from earlier runs of this script —
+# the canonical location is acord/.
+if [ -f "$OUTPUT_DIR/TXLife2.36.00.xsd" ]; then
+    rm -f "$OUTPUT_DIR/TXLife2.36.00.xsd"
 fi
 
 # Create README for the acord directory
@@ -144,8 +172,10 @@ fi
 
 # Download Schema.org (includes insurance-related schemas)
 echo "  → Downloading Schema.org (includes insurance schemas)..."
-curl -sL https://schema.org/version/latest/schemaorg-current-https.ttl -o "$OUTPUT_DIR/schema-org.ttl"
-curl -sL https://schema.org/version/latest/schemaorg-current-https.rdf -o "$OUTPUT_DIR/schema-org.rdf"
+fetch "https://schema.org/version/latest/schemaorg-current-https.ttl" \
+      "$OUTPUT_DIR/schema-org.ttl" "schema-org.ttl" || true
+fetch "https://schema.org/version/latest/schemaorg-current-https.rdf" \
+      "$OUTPUT_DIR/schema-org.rdf" "schema-org.rdf" || true
 
 echo -e "${GREEN}  ✓ Insurance ontologies downloaded successfully${NC}"
 
@@ -157,29 +187,19 @@ echo -e "${YELLOW}[4/5] Downloading HL7 FHIR (Healthcare Standards)...${NC}"
 mkdir -p "$OUTPUT_DIR/fhir"
 
 echo "  → Downloading FHIR core ontology..."
-curl -sL http://hl7.org/fhir/fhir.ttl -o "$OUTPUT_DIR/fhir/fhir.ttl"
-curl -sL http://hl7.org/fhir/fhir.rdf -o "$OUTPUT_DIR/fhir/fhir.rdf"
+# fhir.ttl is the comprehensive FHIR ontology — every resource (Patient,
+# Claim, Coverage, Observation, …) is already a class inside it. Earlier
+# versions of this script also fetched per-resource <resource>.ttl URLs,
+# but hl7.org returns 300 Multiple Choices HTML for those (no per-resource
+# turtle file exists). The single fhir.ttl is sufficient.
+fetch "http://hl7.org/fhir/fhir.ttl" "$OUTPUT_DIR/fhir/fhir.ttl" "fhir.ttl" || true
+fetch "http://hl7.org/fhir/fhir.rdf" "$OUTPUT_DIR/fhir/fhir.rdf" "fhir.rdf" || true
 
-echo "  → Downloading key FHIR resources..."
-# Download commonly used FHIR resources relevant to insurance
-declare -a fhir_resources=(
-    "patient"
-    "practitioner"
-    "organization"
-    "coverage"
-    "claim"
-    "claimresponse"
-    "explanationofbenefit"
-    "insuranceplan"
-    "observation"
-    "condition"
-    "procedure"
-    "medication"
-)
-
-for resource in "${fhir_resources[@]}"; do
-    echo "    - $resource"
-    curl -sL "http://hl7.org/fhir/${resource}.ttl" -o "$OUTPUT_DIR/fhir/${resource}.ttl" 2>/dev/null || true
+# Clean up per-resource HTML stubs from earlier runs of this script
+for stale in patient practitioner organization coverage claim claimresponse \
+             explanationofbenefit insuranceplan observation condition \
+             procedure medication; do
+    rm -f "$OUTPUT_DIR/fhir/${stale}.ttl"
 done
 
 echo -e "${GREEN}  ✓ FHIR ontologies downloaded successfully${NC}"
@@ -208,19 +228,36 @@ echo "  → Downloading W3C standard ontologies..."
 mkdir -p "$OUTPUT_DIR/w3c"
 
 echo "    - OWL-Time"
-curl -sL https://www.w3.org/TR/owl-time/time.ttl -o "$OUTPUT_DIR/w3c/owl-time.ttl"
+fetch "https://www.w3.org/2006/time" "$OUTPUT_DIR/w3c/owl-time.ttl" "owl-time" \
+    || fetch "https://www.w3.org/TR/owl-time/time.ttl" "$OUTPUT_DIR/w3c/owl-time.ttl" "owl-time (fallback)" \
+    || true
 
 echo "    - PROV-O (Provenance)"
-curl -sL https://www.w3.org/ns/prov -H "Accept: text/turtle" -o "$OUTPUT_DIR/w3c/prov.ttl"
+# Content negotiation can produce HTML when servers don't honour Accept; fall
+# back to the canonical RDF/XML URL if the turtle fetch returns HTML or fails.
+if curl --silent --show-error --location --fail --max-time 60 \
+        -H "Accept: text/turtle" \
+        "https://www.w3.org/ns/prov" -o "$OUTPUT_DIR/w3c/prov.ttl" \
+        && [ -s "$OUTPUT_DIR/w3c/prov.ttl" ] \
+        && ! head -c 64 "$OUTPUT_DIR/w3c/prov.ttl" | grep -qi '<html'; then
+    :
+else
+    fetch "https://www.w3.org/ns/prov-o" "$OUTPUT_DIR/w3c/prov.ttl" "prov.ttl" \
+        || fetch "https://www.w3.org/ns/prov.ttl" "$OUTPUT_DIR/w3c/prov.ttl" "prov.ttl (fallback)" \
+        || true
+fi
 
 echo "    - SKOS"
-curl -sL https://www.w3.org/2009/08/skos-reference/skos.rdf -o "$OUTPUT_DIR/w3c/skos.rdf"
+fetch "https://www.w3.org/2009/08/skos-reference/skos.rdf" \
+      "$OUTPUT_DIR/w3c/skos.rdf" "skos" || true
 
 echo "    - Dublin Core Terms"
-curl -sL http://purl.org/dc/terms/ -H "Accept: text/turtle" -o "$OUTPUT_DIR/w3c/dcterms.ttl"
+fetch "https://www.dublincore.org/specifications/dublin-core/dcmi-terms/dublin_core_terms.ttl" \
+      "$OUTPUT_DIR/w3c/dcterms.ttl" "dcterms" || true
 
 echo "    - FOAF"
-curl -sL http://xmlns.com/foaf/0.1/ -H "Accept: application/rdf+xml" -o "$OUTPUT_DIR/w3c/foaf.rdf"
+fetch "http://xmlns.com/foaf/spec/index.rdf" \
+      "$OUTPUT_DIR/w3c/foaf.rdf" "foaf" || true
 
 echo -e "${GREEN}  ✓ Academic ontology patterns downloaded successfully${NC}"
 
@@ -241,12 +278,14 @@ echo ""
 ttl_count=$(find "$OUTPUT_DIR" -name "*.ttl" -type f | wc -l)
 rdf_count=$(find "$OUTPUT_DIR" -name "*.rdf" -type f | wc -l)
 owl_count=$(find "$OUTPUT_DIR" -name "*.owl" -type f | wc -l)
-total_count=$((ttl_count + rdf_count + owl_count))
+xsd_count=$(find "$OUTPUT_DIR" -name "*.xsd" -type f | wc -l)
+total_count=$((ttl_count + rdf_count + owl_count + xsd_count))
 
 echo "Files downloaded:"
 echo "  - Turtle (.ttl): $ttl_count"
 echo "  - RDF/XML (.rdf): $rdf_count"
 echo "  - OWL (.owl): $owl_count"
+echo "  - XSD (.xsd): $xsd_count"
 echo "  - Total: $total_count"
 echo ""
 
@@ -258,6 +297,10 @@ echo ""
 echo -e "${YELLOW}Next steps:${NC}"
 echo "1. Run: python3 convert-ontologies.py"
 echo "   (from the scripts/ directory)"
+echo "   • Aggregator/Metadata RDF files with no classes are skipped by"
+echo "     default; pass --keep-empty to retain them."
+echo "   • Companion <name>-imports.md files capture the owl:imports graph;"
+echo "     pass --no-imports to disable."
 echo "2. Deploy CDK stack to upload to S3"
 echo "   cd ../cdk && npm run cdk deploy semantic-layer-bedrock-kb"
 echo ""

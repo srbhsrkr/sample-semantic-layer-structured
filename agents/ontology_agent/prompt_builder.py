@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 # Separate from the per-ontology namespace — this is a shared, reusable vocabulary.
 VIRTUAL_KG_VOCAB = "https://semantic-layer.aws/virtual-kg/"
 
-MODEL_ID='global.anthropic.claude-opus-4-6-v1'
+MODEL_ID='global.anthropic.claude-opus-4-8'
 
 def _slugify(text: str) -> str:
     """Convert text to a URI-safe slug.
@@ -81,6 +81,39 @@ For each OWL class (table):
 <class_uri> <http://www.w3.org/2000/01/rdf-schema#comment> "{description}" <graph> .
 <class_uri> <https://semantic-layer.aws/virtual-kg/mapsToTable> "{database}.{table_name}" <graph> .
 
+CURATED METADATA ANNOTATIONS (per OWL class — emit the ones you have content for):
+These class-level literals carry the same business context the semantic-RAG metadata
+captures, so the Knowledge-Graph Metadata view shows the SAME sections. Emit each
+predicate at most ONCE per class, ONLY when you have real content — omit a line entirely
+rather than writing an empty or placeholder value. All are owl:Class-subject triples in
+the same named graph. A literal MUST be a single N-Quad line: encode any newline inside a
+value as the two characters backslash + n (\\n), never a real line break, and escape any
+double-quote inside the value as \\".
+<class_uri> <https://semantic-layer.aws/virtual-kg/businessPurpose> "{who uses this data, for what decisions or processes}" <graph> .
+<class_uri> <https://semantic-layer.aws/virtual-kg/businessConcepts> "{everyday terms, synonyms, and natural-language questions this table answers — each mapped to the column(s) that carry them}" <graph> .
+<class_uri> <https://semantic-layer.aws/virtual-kg/acordSourcePath> "{ACORD path, e.g. PolicySummary/Risk/Location — omit this line if not found}" <graph> .
+<class_uri> <https://semantic-layer.aws/virtual-kg/referenceTables> "{each reference/lookup table this table joins to, with join key + SQL join pattern; include inbound + bridge joins}" <graph> .
+<class_uri> <https://semantic-layer.aws/virtual-kg/commonQueryPatterns> "{1-3 plain-English or short-SQL examples of how this table is typically queried}" <graph> .
+<class_uri> <https://semantic-layer.aws/virtual-kg/sampleData> "{first ~3 rows from sample_table_data, one row per \\n — omit this line if sampling returned nothing}" <graph> .
+<class_uri> <https://semantic-layer.aws/virtual-kg/notes> "{caveats, known data-quality issues, or relationships — omit this line if none}" <graph> .
+
+CURATED ANNOTATION CONTENT RULES (match the semantic-RAG metadata quality, not just shape):
+- businessPurpose: one sentence — what this data is used for and by whom.
+- businessConcepts: map the question's likely words (participant, role, member, owner,
+  beneficiary, who, policy, contract, ...) onto the ACTUAL columns that carry them, even when
+  those words are NOT the literal column/table names. This is what makes the class findable by
+  natural-language search. e.g. "insured participant / who is covered → party_id; participant
+  role / base vs rider → coverage_type".
+- referenceTables: declare joins in BOTH directions — this table's outbound parent FK AND any
+  table in this ontology whose FK points back to this table's key — plus any bridge path to
+  relate two entities that do not join directly (e.g. holding↔party only via coverage). When two
+  key columns hold the same logical id in different surface forms (e.g. 'PARTY#PARTY000042' vs
+  'PARTY000042'), write the exact transform in the ON clause, not a bare equality.
+- commonQueryPatterns: phrase at least one in the user's natural-language terms, not just SQL.
+- CROSS-REFERENCE RESTRICTION (CRITICAL): every table named in referenceTables or
+  commonQueryPatterns MUST be one of the tables in the ALL TABLES IN THIS ONTOLOGY list. Never
+  invent a plausible ACORD table that was not materialized here — omit the reference instead.
+
 For each OWL DatatypeProperty (column):
 <property_uri> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#DatatypeProperty> <graph> .
 <property_uri> <http://www.w3.org/2000/01/rdf-schema#label> "{property label}" <graph> .
@@ -146,6 +179,10 @@ EXAMPLE — complete owl:Class + owl:DatatypeProperty (all required triples):
 <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <http://www.w3.org/2000/01/rdf-schema#label> "Party" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
 <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <http://www.w3.org/2000/01/rdf-schema#comment> "Represents a customer record in the insurance_db.customer table" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
 <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <https://semantic-layer.aws/virtual-kg/mapsToTable> "insurance_db.customer" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
+<http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <https://semantic-layer.aws/virtual-kg/businessPurpose> "Used by sales, underwriting, and servicing to identify the people and organizations a policy is held by or insures." <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
+<http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <https://semantic-layer.aws/virtual-kg/businessConcepts> "person / customer / individual / who → party_id (the party identity); name / full name → first_name + last_name. Answers: 'who owns this policy?'" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
+<http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <https://semantic-layer.aws/virtual-kg/referenceTables> "coverage joins on party_id (coverage.party_id = party.party_id) to relate a party to the holdings they are insured on; to reach holding, bridge through coverage." <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
+<http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party> <https://semantic-layer.aws/virtual-kg/commonQueryPatterns> "Who are the parties on a given policy? JOIN coverage c ON c.party_id = party.party_id WHERE c.holding_id = ?" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
 <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party/email> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#DatatypeProperty> <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
 <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party/email> <http://www.w3.org/2000/01/rdf-schema#label> "email" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
 <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890/Party/email> <http://www.w3.org/2000/01/rdf-schema#comment> "Customer email address" <http://insurance/ontology/a1b2c3d4-e5f6-7890-abcd-ef1234567890> .
@@ -310,6 +347,12 @@ YOUR TASK — process THIS TABLE ONLY:
    a. Write the NAMESPACE TRIPLES block above + the owl:Class triples for this table in one call:
       append_nquads(ontology_id="{ontology_id}", table_name="{table}", nquad_batch=<namespace triples + class N-Quads>)
       The namespace triples (hasDatabase / hasCatalog / hasDataSource) are pre-filled above — copy them exactly.
+      INCLUDE in this same class batch the CURATED METADATA ANNOTATION triples you have content for
+      (businessPurpose / businessConcepts / acordSourcePath / referenceTables / commonQueryPatterns /
+      notes) per the spec in your system instructions — these give the Knowledge-Graph view the same
+      sections as the semantic-RAG metadata. Each is ONE line; omit any you have no content for. The
+      whole class batch (namespace + class type/label/comment/mapsToTable + annotations) stays well
+      under the 70-line limit.
    b. Process columns in batches of EXACTLY 10. For each batch:
       - Generate owl:DatatypeProperty N-Quads for those 10 columns ONLY (max 70 lines)
       - Call append_nquads(ontology_id="{ontology_id}", table_name="{table}", nquad_batch=<batch N-Quads>)
